@@ -16,7 +16,7 @@ class Event(Base):
     event_type: Mapped[str] = mapped_column(String(30), nullable=False)
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
-    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
 
     delivery_attempts: Mapped[list["DeliveryAttempt"]] = relationship(back_populates="event")
     dead_letters: Mapped[list["DeadLetter"]] = relationship(back_populates="event")
