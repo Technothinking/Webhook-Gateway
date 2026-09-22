@@ -1147,3 +1147,909 @@ Event Querying
 The system can now **accept an event, persist it reliably, deduplicate repeated submissions, and query it back**.
 
 No event is delivered to subscribers yet. Delivery begins in the subsequent phases.
+
+# Webhook Reliability Gateway — Week 1 Day 4
+
+# Week 1 — Day 4: Subscriber Management
+
+## Status: COMPLETED ✅
+
+Subscriber management has been implemented and tested.
+
+The system can now:
+
+* Create webhook subscribers
+* Generate a secure HMAC secret for each subscriber
+* Return the generated secret only when the subscriber is created
+* Prevent the secret from being exposed through normal subscriber responses
+* Subscribe a subscriber to specific event types
+* Prevent duplicate subscriptions
+* List all registered subscribers
+* Pause a subscriber
+* Resume a subscriber
+
+No actual webhook delivery has been implemented yet. Subscriber management only prepares the configuration that will later be used by the delivery system.
+
+---
+
+# Subscriber Schemas
+
+Two dedicated schema files were created/updated:
+
+```text
+api/app/schemas/
+├── subscriber.py
+└── subscription.py
+```
+
+---
+
+## SubscriberCreate
+
+The request schema for creating a subscriber is:
+
+```python
+class SubscriberCreate(BaseModel):
+    name: str
+    endpoint_url: HttpUrl
+```
+
+The client provides:
+
+```text
+name
+endpoint_url
+```
+
+Server-controlled values such as:
+
+```text
+id
+secret
+status
+created_at
+```
+
+are not accepted from the client.
+
+---
+
+## SubscriberResponse
+
+The normal subscriber response schema is:
+
+```python
+class SubscriberResponse(BaseModel):
+    id: UUID
+    name: str
+    endpoint_url: str
+    status: str
+    created_at: datetime
+```
+
+Notice that the `secret` field is intentionally not included.
+
+This prevents the secret from being exposed when subscribers are listed or updated.
+
+---
+
+## SubscriberCreateResponse
+
+A separate response schema was created for subscriber creation:
+
+```python
+class SubscriberCreateResponse(SubscriberResponse):
+    secret: str
+```
+
+This allows the secret to be returned when the subscriber is first created while keeping it hidden from all normal subscriber responses.
+
+Conceptually:
+
+```text
+POST /subscribers
+       ↓
+Create subscriber
+       ↓
+Generate secret
+       ↓
+Return secret once
+       ↓
+Future responses
+       ↓
+Secret not included
+```
+
+---
+
+## SubscriberUpdate
+
+The update schema is:
+
+```python
+class SubscriberUpdate(BaseModel):
+    status: Literal["active", "paused"]
+```
+
+Therefore the subscriber status can only be changed to:
+
+```text
+active
+paused
+```
+
+Invalid status values are rejected by Pydantic validation.
+
+---
+
+# Subscription Schemas
+
+The subscription schemas are defined in:
+
+```text
+api/app/schemas/subscription.py
+```
+
+---
+
+## SubscriptionCreate
+
+The request schema is:
+
+```python
+class SubscriptionCreate(BaseModel):
+    event_type: str
+```
+
+The client only needs to provide the event type it wants to receive.
+
+---
+
+## SubscriptionResponse
+
+The response schema is:
+
+```python
+class SubscriptionResponse(BaseModel):
+    id: UUID
+    subscriber_id: UUID
+    event_type: str
+    is_active: bool
+```
+
+This represents the relationship between a subscriber and an event type.
+
+---
+
+# Subscriber Routes
+
+A new router was created in:
+
+```text
+api/app/routes/subscribers.py
+```
+
+The router uses:
+
+```python
+router = APIRouter(
+    prefix="/subscribers",
+    tags=["Subscribers"]
+)
+```
+
+Therefore all subscriber management endpoints are grouped under:
+
+```text
+/subscribers
+```
+
+---
+
+# POST /subscribers
+
+The endpoint:
+
+```text
+POST /subscribers/
+```
+
+creates a new webhook subscriber.
+
+The request contains:
+
+```json
+{
+  "name": "Payment Service",
+  "endpoint_url": "https://example.com/webhook"
+}
+```
+
+---
+
+## Secret Generation
+
+When a subscriber is created, the gateway generates a secure secret using Python's `secrets` module:
+
+```python
+secret = secrets.token_urlsafe(32)
+```
+
+This secret is stored with the subscriber and will later be used for webhook authentication/signing.
+
+The important security behavior is:
+
+```text
+Subscriber Creation
+        ↓
+Generate secret
+        ↓
+Store secret
+        ↓
+Return secret in creation response
+        ↓
+Do not expose secret again
+```
+
+The secret is therefore treated as a value that should be captured by the subscriber owner when the subscriber is created.
+
+---
+
+## Subscriber Creation Flow
+
+The complete flow is:
+
+```text
+POST /subscribers/
+        ↓
+Validate request
+        ↓
+Generate secure secret
+        ↓
+Create Subscriber
+        ↓
+Set status = active
+        ↓
+Save to PostgreSQL
+        ↓
+Refresh database object
+        ↓
+Return SubscriberCreateResponse
+```
+
+A newly created subscriber starts with:
+
+```text
+status = active
+```
+
+---
+
+# POST /subscribers/{id}/subscriptions
+
+The endpoint:
+
+```text
+POST /subscribers/{subscriber_id}/subscriptions
+```
+
+attaches an event type to a subscriber.
+
+Example request:
+
+```json
+{
+  "event_type": "order.created"
+}
+```
+
+The resulting relationship is:
+
+```text
+Subscriber
+    │
+    └── Subscription
+            │
+            └── order.created
+```
+
+---
+
+## Subscriber Existence Check
+
+Before creating the subscription, the API verifies that the subscriber exists.
+
+Flow:
+
+```text
+POST subscription
+        ↓
+Find subscriber by ID
+        ↓
+ ┌──────┴──────┐
+ │             │
+Found       Not Found
+ │             │
+ ▼             ▼
+Create        404
+subscription
+```
+
+If the subscriber does not exist:
+
+```text
+404 Not Found
+```
+
+is returned.
+
+---
+
+## Creating the Subscription
+
+A new `Subscription` is created with:
+
+```text
+subscriber_id
+event_type
+is_active = true
+```
+
+The subscription is then committed to PostgreSQL.
+
+A successful creation returns the subscription information using `SubscriptionResponse`.
+
+---
+
+# Duplicate Subscription Handling
+
+The database already contains a composite unique constraint:
+
+```text
+(subscriber_id, event_type)
+```
+
+with the constraint name:
+
+```text
+uq_subscription_subscriber_event_type
+```
+
+This prevents the same subscriber from being subscribed to the same event type more than once.
+
+Example:
+
+```text
+Subscriber A → order.created
+Subscriber A → order.created
+                    ❌
+```
+
+The API also handles the resulting database `IntegrityError`.
+
+Flow:
+
+```text
+Create subscription
+        ↓
+Database UNIQUE constraint
+        ↓
+Duplicate?
+   ┌────┴─────┐
+   │          │
+  No         Yes
+   │          │
+   ▼          ▼
+Commit     IntegrityError
+             ↓
+          Rollback
+             ↓
+           409
+```
+
+The duplicate subscription response is:
+
+```text
+409 Conflict
+```
+
+with the message:
+
+```text
+Subscriber is already subscribed to this event type
+```
+
+The transaction is rolled back before returning the error.
+
+---
+
+# GET /subscribers
+
+The endpoint:
+
+```text
+GET /subscribers/
+```
+
+returns all registered subscribers.
+
+The subscribers are ordered by:
+
+```text
+created_at DESC
+```
+
+so the newest subscribers are returned first.
+
+The response uses:
+
+```python
+list[SubscriberResponse]
+```
+
+Importantly, `SubscriberResponse` does not contain the secret.
+
+Therefore:
+
+```text
+GET /subscribers/
+        ↓
+SubscriberResponse
+        ↓
+No secret exposed
+```
+
+This ensures that the secret generated during subscriber creation is not returned through the listing endpoint.
+
+---
+
+# PATCH /subscribers/{id}
+
+The endpoint:
+
+```text
+PATCH /subscribers/{subscriber_id}
+```
+
+is used to change a subscriber's status.
+
+The request body is:
+
+```json
+{
+  "status": "paused"
+}
+```
+
+or:
+
+```json
+{
+  "status": "active"
+}
+```
+
+---
+
+## Pause Subscriber
+
+A subscriber can be paused by sending:
+
+```json
+{
+  "status": "paused"
+}
+```
+
+The database value becomes:
+
+```text
+status = paused
+```
+
+This provides the configuration needed for the later delivery system to stop treating the subscriber as active.
+
+---
+
+## Resume Subscriber
+
+A paused subscriber can be resumed using:
+
+```json
+{
+  "status": "active"
+}
+```
+
+The database value becomes:
+
+```text
+status = active
+```
+
+---
+
+## Subscriber Update Flow
+
+```text
+PATCH /subscribers/{id}
+        ↓
+Find subscriber
+        ↓
+ ┌──────┴──────┐
+ │             │
+Found       Not Found
+ │             │
+ ▼             ▼
+Validate       404
+status
+ │
+ ▼
+Update status
+ │
+ ▼
+Commit
+ │
+ ▼
+Refresh
+ │
+ ▼
+Return SubscriberResponse
+```
+
+If the subscriber does not exist:
+
+```text
+404 Not Found
+```
+
+is returned.
+
+Only the following values are accepted:
+
+```text
+active
+paused
+```
+
+---
+
+# Secret Exposure Design
+
+One of the important security decisions implemented on Day 4 is separating the creation response from the normal subscriber response.
+
+The schemas intentionally behave as follows:
+
+```text
+POST /subscribers/
+        │
+        ▼
+SubscriberCreateResponse
+        │
+        ├── id
+        ├── name
+        ├── endpoint_url
+        ├── status
+        ├── created_at
+        └── secret   ← returned here
+```
+
+But:
+
+```text
+GET /subscribers/
+        │
+        ▼
+SubscriberResponse
+        │
+        ├── id
+        ├── name
+        ├── endpoint_url
+        ├── status
+        └── created_at
+              └── no secret
+```
+
+Similarly, the PATCH response does not expose the secret.
+
+This establishes the intended behavior:
+
+> The subscriber secret is returned during creation but is never included in normal subscriber responses.
+
+---
+
+# Updated API Structure
+
+After Day 4, the API now contains event and subscriber routes:
+
+```text
+api/app/
+├── db/
+├── models/
+├── routes/
+│   ├── events.py
+│   └── subscribers.py
+├── schemas/
+│   ├── event.py
+│   ├── subscriber.py
+│   └── subscription.py
+└── main.py
+```
+
+The subscriber router is registered in `main.py`:
+
+```python
+from app.routes.subscribers import router as subscriber_router
+
+app.include_router(subscriber_router)
+```
+
+Therefore FastAPI now exposes both:
+
+```text
+/events
+/subscribers
+```
+
+---
+
+# Day 4 API Summary
+
+The subscriber management API now consists of:
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| POST | `/subscribers/` | Create a subscriber and return its generated secret |
+| POST | `/subscribers/{subscriber_id}/subscriptions` | Subscribe a subscriber to an event type |
+| GET | `/subscribers/` | List all subscribers without exposing secrets |
+| PATCH | `/subscribers/{subscriber_id}` | Pause or resume a subscriber |
+
+---
+
+# Day 4 Testing
+
+All Day 4 endpoints were manually tested successfully.
+
+## Subscriber Creation
+
+Tested:
+
+```text
+POST /subscribers/
+```
+
+Result:
+
+```text
+Subscriber created successfully
+```
+
+The generated secret was returned in the creation response.
+
+---
+
+## Subscription Creation
+
+Tested:
+
+```text
+POST /subscribers/{subscriber_id}/subscriptions
+```
+
+Result:
+
+```text
+Subscription created successfully
+```
+
+The subscription correctly connects the subscriber to the requested event type.
+
+---
+
+## Duplicate Subscription
+
+The same subscriber was subscribed to the same event type again.
+
+The API correctly detected the duplicate and returned the expected conflict behavior:
+
+```text
+409 Conflict
+```
+
+---
+
+## Subscriber Listing
+
+Tested:
+
+```text
+GET /subscribers/
+```
+
+Result:
+
+```text
+Subscribers returned successfully
+```
+
+The secret was not included in the response.
+
+---
+
+## Pause / Resume
+
+Tested:
+
+```text
+PATCH /subscribers/{subscriber_id}
+```
+
+with:
+
+```json
+{
+  "status": "paused"
+}
+```
+
+and then:
+
+```json
+{
+  "status": "active"
+}
+```
+
+Both operations worked correctly.
+
+---
+
+# Current Completion Status
+
+```text
+Phase 0 — Setup
+    ✅ Docker Compose
+    ✅ PostgreSQL
+    ✅ Redis
+    ✅ FastAPI
+    ✅ Next.js
+    ✅ Alembic
+
+Week 1 — Day 1–2
+    ✅ SQLAlchemy database base
+    ✅ Database engine
+    ✅ Session factory
+    ✅ Subscriber model
+    ✅ Subscription model
+    ✅ Event model
+    ✅ DeliveryAttempt model
+    ✅ DeadLetter model
+    ✅ Relationships
+    ✅ Unique constraints
+    ✅ Alembic migration
+    ✅ Migration applied to PostgreSQL
+    ✅ Database schema verified
+    ✅ Demo seed data
+
+Week 1 — Day 3
+    ✅ POST /events
+    ✅ Event validation
+    ✅ Event persistence
+    ✅ Default pending status
+    ✅ Idempotency handling
+    ✅ Database UNIQUE constraint fallback
+    ✅ Concurrency-safe duplicate handling
+    ✅ GET /events/{id}
+    ✅ GET /events
+    ✅ Event type filtering
+    ✅ Status filtering
+    ✅ Pagination
+    ✅ Newest-first ordering
+
+Week 1 — Day 4
+    ✅ SubscriberCreate schema
+    ✅ SubscriberResponse schema
+    ✅ SubscriberCreateResponse schema
+    ✅ SubscriberUpdate schema
+    ✅ SubscriptionCreate schema
+    ✅ SubscriptionResponse schema
+    ✅ POST /subscribers/
+    ✅ Secure secret generation
+    ✅ Secret returned only during creation
+    ✅ Secret hidden from normal responses
+    ✅ POST /subscribers/{id}/subscriptions
+    ✅ Subscriber existence validation
+    ✅ Duplicate subscription handling
+    ✅ GET /subscribers/
+    ✅ PATCH /subscribers/{id}
+    ✅ Pause subscriber
+    ✅ Resume subscriber
+    ✅ Manual endpoint testing
+```
+
+---
+
+# Current Position
+
+**The project is currently finished through Week 1 — Day 4: Subscriber Management.**
+
+The gateway can now:
+
+```text
+                    ┌──────────────────┐
+                    │     Producer     │
+                    └────────┬─────────┘
+                             │
+                             │ POST event
+                             ▼
+                    ┌──────────────────┐
+                    │   Event Ingest   │
+                    │      API         │
+                    └────────┬─────────┘
+                             │
+                             ▼
+                       PostgreSQL
+                             │
+                             │
+                    ┌────────┴─────────┐
+                    │                  │
+                    ▼                  ▼
+                Events            Subscribers
+                                     │
+                                     ▼
+                                Subscriptions
+```
+
+At this point:
+
+* Events can be persisted reliably.
+* Duplicate events are handled using idempotency.
+* Subscribers can be registered.
+* Subscribers can subscribe to event types.
+* Subscribers can be paused and resumed.
+* Subscriber secrets are protected from normal API responses.
+
+There is still **no actual webhook delivery**.
+
+---
+
+# Next Step — Week 1 Day 5
+
+The next planned step is testing and documentation.
+
+The Day 5 plan is:
+
+```text
+Week 1 — Day 5
+    │
+    ├── pytest idempotency dedup test
+    ├── subscriber CRUD tests
+    ├── subscription filtering logic tests
+    └── docs/schema.md
+```
+
+The schema documentation will explain the important relationship:
+
+```text
+Event
+  │
+  └──< DeliveryAttempt
+             │
+             └── Subscriber
+```
+
+The immediate goal is to make sure the existing Week 1 functionality is covered by automated tests before moving into the delivery system.
+
+---
+
+# Important Continuation Point
+
+The existing database schema and Day 3–4 API implementation have already been tested successfully.
+
+The project should continue from the current implementation rather than redesigning the existing schema.
+
+The next work should start with:
+
+**Week 1 → Day 5: Tests + Documentation**
+
+After Week 1 is complete, the project can move into the delivery pipeline, beginning with the Redis Streams publishing and worker flow.
