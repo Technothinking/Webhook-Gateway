@@ -636,3 +636,514 @@ The person continuing this project should **not redesign the existing database s
 The next work should start from:
 
 **Week 1 → Ingest API + Outbox Pattern + Idempotency**, while preserving the correctness-first approach.
+
+# Week 1 — Day 3: Event Ingest API
+
+## Status: COMPLETED ✅
+
+The event ingestion API has been implemented and tested.
+
+The system can now:
+
+* Accept webhook events through `POST /events`
+* Validate incoming event data using Pydantic
+* Persist events in PostgreSQL
+* Automatically assign the initial event status
+* Prevent duplicate events using idempotency keys
+* Handle concurrent duplicate requests safely
+* Retrieve an individual event using `GET /events/{id}`
+* Retrieve multiple events using `GET /events`
+* Filter events by `event_type`
+* Filter events by `status`
+* Paginate event results
+* Return events in deterministic newest-first order
+
+No event delivery has been implemented yet. Events are only persisted and queryable at this stage.
+
+---
+
+# Event Request Schema
+
+A dedicated Pydantic request schema was created for event creation:
+
+```python
+class EventCreate(BaseModel):
+    event_type: str
+    payload: dict
+    idempotency_key: str
+```
+
+The client provides only the information required to create an event.
+
+Server-controlled fields such as:
+
+* `id`
+* `created_at`
+* `status`
+
+are not accepted from the client.
+
+---
+
+# Event Response Schema
+
+A separate response schema was added:
+
+```python
+class EventResponse(BaseModel):
+    id: UUID
+    idempotency_key: str
+    event_type: str
+    payload: dict
+    created_at: datetime
+    status: str
+```
+
+The response schema uses SQLAlchemy ORM attribute support so database model instances can be returned directly through FastAPI.
+
+Conceptually:
+
+```text
+Client Request
+      ↓
+EventCreate
+      ↓
+FastAPI Route
+      ↓
+SQLAlchemy Event
+      ↓
+PostgreSQL
+      ↓
+EventResponse
+      ↓
+Client
+```
+
+---
+
+# POST /events
+
+The event ingestion endpoint accepts:
+
+```text
+POST /events
+```
+
+with a request body:
+
+```json
+{
+  "event_type": "order.created",
+  "payload": {
+    "order_id": 123,
+    "amount": 499
+  },
+  "idempotency_key": "test-001"
+}
+```
+
+The event is converted from the Pydantic request model into the SQLAlchemy `Event` model and persisted using the database session.
+
+The basic persistence flow is:
+
+```text
+POST /events
+      ↓
+Validate request
+      ↓
+Check idempotency key
+      ↓
+Create Event
+      ↓
+db.add()
+      ↓
+db.commit()
+      ↓
+db.refresh()
+      ↓
+Return EventResponse
+```
+
+A newly created event returns:
+
+```text
+201 Created
+```
+
+---
+
+# Event Status Default
+
+The `Event.status` column is `NOT NULL`.
+
+During initial testing, an insertion failed because the API did not explicitly provide a status:
+
+```text
+NotNullViolation:
+null value in column "status" of relation "event"
+```
+
+The SQLAlchemy model was therefore updated with an initial default status:
+
+```python
+status = mapped_column(
+    String,
+    nullable=False,
+    default="pending"
+)
+```
+
+Therefore newly created events automatically begin with:
+
+```text
+status = pending
+```
+
+The client does not control this value.
+
+---
+
+# Idempotency
+
+Idempotency prevents the same logical event from being inserted multiple times when a producer retries the same request.
+
+The `idempotency_key` column already has a database-level `UNIQUE` constraint.
+
+The request flow is:
+
+```text
+POST /events
+      ↓
+Search idempotency_key
+      ↓
+ ┌────┴─────┐
+ │          │
+Exists     New
+ │          │
+ ▼          ▼
+Return     Create
+existing   event
+event       │
+ │          ▼
+ ▼        Commit
+200         │
+            ▼
+           201
+```
+
+For example, submitting:
+
+```json
+{
+  "event_type": "order.created",
+  "payload": {
+    "order_id": 123
+  },
+  "idempotency_key": "test-001"
+}
+```
+
+multiple times does not create multiple events.
+
+The first request creates the event:
+
+```text
+201 Created
+```
+
+A subsequent request with the same idempotency key returns the existing event:
+
+```text
+200 OK
+```
+
+The existing event retains the same event ID.
+
+---
+
+# Concurrency-Safe Idempotency
+
+A simple application-level lookup is not sufficient when multiple identical requests arrive simultaneously.
+
+Potential race condition:
+
+```text
+Request A                  Request B
+    │                          │
+    ├─ check key ──┐           │
+    │              │           ├─ check key
+    │           not found      │
+    │              │           │
+    │              │        not found
+    │              │           │
+    ├── INSERT ────────────────┤
+    │                          │
+    │                       INSERT
+    │                          │
+    ▼                          ▼
+success                 UNIQUE constraint
+                            violation
+```
+
+The database `UNIQUE` constraint on `idempotency_key` acts as the final correctness guarantee.
+
+The implementation catches `IntegrityError`:
+
+```text
+IntegrityError
+      ↓
+db.rollback()
+      ↓
+Fetch event using idempotency_key
+      ↓
+Return existing event
+      ↓
+200 OK
+```
+
+The rollback is necessary because after a database integrity error, the SQLAlchemy transaction must be rolled back before another query can be executed using the same session.
+
+Therefore, concurrent duplicate requests resolve to the same persisted event instead of creating duplicate rows or returning an unexpected `500` error.
+
+---
+
+# GET /events/{id}
+
+An individual event can be retrieved using:
+
+```text
+GET /events/{id}
+```
+
+The endpoint searches PostgreSQL using the event UUID.
+
+Flow:
+
+```text
+GET /events/{id}
+      ↓
+Query Event by ID
+      ↓
+ ┌────┴─────┐
+ │          │
+Found     Not Found
+ │          │
+ ▼          ▼
+Return     404
+event
+```
+
+A valid event returns:
+
+```text
+200 OK
+```
+
+If the event does not exist:
+
+```text
+404 Not Found
+```
+
+FastAPI also validates the UUID path parameter.
+
+---
+
+# GET /events
+
+The event listing endpoint supports:
+
+```text
+GET /events/
+```
+
+It returns a list of events using the `EventResponse` schema.
+
+---
+
+## Event Type Filtering
+
+Events can be filtered using:
+
+```text
+GET /events/?event_type=order.created
+```
+
+This returns only events whose:
+
+```text
+event_type = order.created
+```
+
+---
+
+## Status Filtering
+
+Events can also be filtered using:
+
+```text
+GET /events/?status=pending
+```
+
+This returns events whose:
+
+```text
+status = pending
+```
+
+---
+
+## Combined Filtering
+
+Both filters can be used together:
+
+```text
+GET /events/?event_type=order.created&status=pending
+```
+
+The query applies both conditions.
+
+Conceptually:
+
+```text
+event_type = order.created
+        AND
+status = pending
+```
+
+---
+
+# Pagination
+
+The `GET /events` endpoint supports offset-based pagination.
+
+Parameters:
+
+```text
+skip
+limit
+```
+
+Example:
+
+```text
+GET /events/?skip=0&limit=10
+```
+
+The next page can be retrieved using:
+
+```text
+GET /events/?skip=10&limit=10
+```
+
+Validation was added so:
+
+* `skip >= 0`
+* `limit >= 1`
+* `limit <= 100`
+
+This prevents invalid or excessively large requests.
+
+---
+
+# Deterministic Ordering
+
+Events are ordered by:
+
+```text
+created_at DESC
+```
+
+Therefore the newest events appear first.
+
+Conceptually:
+
+```text
+Newest Event
+     ↓
+   Event
+     ↓
+   Event
+     ↓
+   Event
+     ↓
+Oldest Event
+```
+
+Deterministic ordering is important when using offset pagination so that successive requests have a predictable ordering.
+
+---
+
+# API Endpoints Completed
+
+The Week 1 Day 3 event API now contains:
+
+```text
+POST /events/
+    ├── Request validation
+    ├── Event persistence
+    ├── Status initialization
+    ├── Idempotency
+    └── Concurrency-safe duplicate handling
+
+GET /events/{id}
+    └── Retrieve a single event
+
+GET /events/
+    ├── Pagination
+    ├── event_type filtering
+    ├── status filtering
+    └── created_at DESC ordering
+```
+
+---
+
+# Testing Completed
+
+The following flows were manually tested successfully:
+
+* Creating a new event
+* Verifying the event in PostgreSQL
+* Submitting the same idempotency key again
+* Confirming no duplicate event was created
+* Confirming the existing event ID is returned
+* Testing concurrent duplicate handling
+* Retrieving an event by ID
+* Requesting a non-existent event
+* Listing events
+* Filtering by `event_type`
+* Filtering by `status`
+* Combining both filters
+* Testing pagination with `skip` and `limit`
+* Verifying newest-first ordering
+
+---
+
+# Day 3 Checkpoint
+
+```text
+Week 1 — Day 3 ✅
+
+Event Ingestion
+      │
+      ├── POST /events
+      │
+      ├── PostgreSQL persistence
+      │
+      ├── Idempotency
+      │
+      └── Concurrency-safe deduplication
+      │
+      ▼
+Event Querying
+      │
+      ├── GET /events/{id}
+      │
+      ├── GET /events
+      ├── Filtering
+      └── Pagination
+```
+
+The system can now **accept an event, persist it reliably, deduplicate repeated submissions, and query it back**.
+
+No event is delivered to subscribers yet. Delivery begins in the subsequent phases.
