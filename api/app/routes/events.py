@@ -5,19 +5,11 @@ from sqlalchemy.orm import Session
 from uuid import UUID
 from fastapi import Query
 
-from app.db.session import SessionLocal
+from app.db.session import get_db
 from app.models.event import Event
 from app.schemas.event import EventCreate, EventResponse
 
 router = APIRouter(prefix="/events", tags=["Events"])
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 
 @router.post("/",response_model=EventResponse,)
