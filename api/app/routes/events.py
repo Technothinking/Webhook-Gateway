@@ -9,7 +9,7 @@ from app.db.session import SessionLocal
 from app.models.event import Event
 from app.schemas.event import EventCreate, EventResponse
 
-eventRouter = APIRouter(prefix="/events", tags=["Events"])
+router = APIRouter(prefix="/events", tags=["Events"])
 
 
 def get_db():
@@ -20,7 +20,7 @@ def get_db():
         db.close()
 
 
-@eventRouter.post("/",response_model=EventResponse,)
+@router.post("/",response_model=EventResponse,)
 def create_event(event: EventCreate, response: Response, db: Session = Depends(get_db)):
     # First check for an existing event
     stmt = select(Event).where(
@@ -62,7 +62,7 @@ def create_event(event: EventCreate, response: Response, db: Session = Depends(g
         return existing_event
 
 
-@eventRouter.get("/{event_id}", response_model=EventResponse)
+@router.get("/{event_id}", response_model=EventResponse)
 def get_event(
     event_id: UUID,
     db: Session = Depends(get_db)
@@ -81,7 +81,7 @@ def get_event(
     return event
 
 
-@eventRouter.get("/", response_model=list[EventResponse])
+@router.get("/", response_model=list[EventResponse])
 def get_events(
     event_type: str | None = None,
     event_status: str | None = Query(default=None, alias="status"),
