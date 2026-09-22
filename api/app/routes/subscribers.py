@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.models.subscriber import Subscriber
-from app.schemas.subscriber import SubscriberCreate, SubscriberCreateResponse
+from app.schemas.subscriber import SubscriberCreate, SubscriberCreateResponse, SubscriberResponse, SubscriberUpdate
 
 from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
@@ -93,3 +93,48 @@ def create_subscription(
     db.refresh(subscription)
 
     return subscription
+
+
+@router.get(
+    "/",
+    response_model=list[SubscriberResponse],
+)
+def get_subscribers(
+    db: Session = Depends(get_db),
+):
+    subscribers = (
+        db.query(Subscriber)
+        .order_by(Subscriber.created_at.desc())
+        .all()
+    )
+
+    return subscribers
+
+
+@router.patch(
+    "/{subscriber_id}",
+    response_model=SubscriberResponse,
+)
+def update_subscriber(
+    subscriber_id: UUID,
+    subscriber_data: SubscriberUpdate,
+    db: Session = Depends(get_db),
+):
+    subscriber = (
+        db.query(Subscriber)
+        .filter(Subscriber.id == subscriber_id)
+        .first()
+    )
+
+    if subscriber is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Subscriber not found",
+        )
+
+    subscriber.status = subscriber_data.status
+
+    db.commit()
+    db.refresh(subscriber)
+
+    return subscriber

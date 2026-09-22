@@ -1,7 +1,7 @@
 from pydantic import BaseModel, HttpUrl
 from uuid import UUID
 from datetime import datetime
-
+from typing import Literal
 
 class SubscriberCreate(BaseModel):
     name: str
@@ -18,3 +18,7 @@ class SubscriberResponse(BaseModel):
 
 class SubscriberCreateResponse(SubscriberResponse):
     secret: str
+
+
+class SubscriberUpdate(BaseModel):
+    status: Literal["active", "paused"]
