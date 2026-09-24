@@ -2053,3 +2053,655 @@ The next work should start with:
 **Week 1 → Day 5: Tests + Documentation**
 
 After Week 1 is complete, the project can move into the delivery pipeline, beginning with the Redis Streams publishing and worker flow.
+
+
+
+# Week 1 — Day 5: Tests + Documentation
+
+## Status: COMPLETED ✅
+
+Week 1 Day 5 testing and documentation have been completed.
+
+The project now has automated tests covering:
+
+* Event idempotency
+* Subscriber creation
+* Subscriber listing
+* Subscriber status updates
+* Subscription creation
+* Duplicate subscription prevention
+
+The database schema and core relationships have also been documented in:
+
+```text
+docs/schema.md
+```
+
+No actual webhook delivery has been implemented yet. Delivery begins in Week 2.
+
+---
+
+# Testing Setup
+
+A pytest-based test structure was added:
+
+```text
+tests/
+├── __init__.py
+├── conftest.py
+├── test_events.py
+├── test_subscribers.py
+└── test_subscriptions.py
+```
+
+The test suite uses FastAPI's `TestClient` and overrides the application's database dependency during testing.
+
+Tests can be executed inside the API container using:
+
+```bash
+docker compose exec api pytest -v
+```
+
+---
+
+# Event Tests
+
+## Root Endpoint Test
+
+The basic FastAPI root endpoint is tested to ensure that the application is running correctly.
+
+The test verifies:
+
+```text
+GET /
+   ↓
+200 OK
+   ↓
+Webhook Reliability Gateway API is running.
+```
+
+---
+
+## Idempotency Test
+
+The idempotency test submits the same event twice using the same idempotency key.
+
+Flow:
+
+```text
+First Request
+      │
+      ▼
+POST /events
+      │
+      ▼
+201 Created
+      │
+      ▼
+Event stored
+```
+
+The same request is then submitted again:
+
+```text
+Second Request
+      │
+      ▼
+POST /events
+      │
+      ▼
+Existing idempotency key
+      │
+      ▼
+200 OK
+```
+
+The test verifies that:
+
+```text
+event1.id == event2.id
+```
+
+and:
+
+```text
+event1.idempotency_key == event2.idempotency_key
+```
+
+Therefore, repeated submissions do not create duplicate events.
+
+A unique idempotency key is generated for each test execution so that repeated pytest runs do not depend on data left behind by previous test runs.
+
+---
+
+# Subscriber Tests
+
+## Create Subscriber
+
+The subscriber creation test verifies:
+
+```text
+POST /subscribers/
+```
+
+successfully creates a subscriber.
+
+The test verifies:
+
+* HTTP status `201`
+* Subscriber name
+* Endpoint URL
+* Initial status is `active`
+* A secret is generated
+* The generated secret is not empty
+* Subscriber ID is returned
+* Creation timestamp is returned
+
+Conceptually:
+
+```text
+POST /subscribers/
+        │
+        ▼
+Create Subscriber
+        │
+        ├── Generate secret
+        ├── status = active
+        └── Store in PostgreSQL
+        │
+        ▼
+201 Created
+```
+
+---
+
+## List Subscribers
+
+The subscriber listing test verifies:
+
+```text
+GET /subscribers/
+```
+
+returns a list of registered subscribers.
+
+It also verifies that the subscriber secret is **not exposed** by the normal subscriber response.
+
+Therefore:
+
+```text
+POST /subscribers/
+        │
+        └── secret returned during creation
+
+GET /subscribers/
+        │
+        └── secret NOT returned
+```
+
+This preserves the intended secret-handling behavior implemented on Day 4.
+
+---
+
+## Update Subscriber
+
+The subscriber update test verifies:
+
+```text
+PATCH /subscribers/{subscriber_id}
+```
+
+can change the subscriber status.
+
+The test changes:
+
+```text
+active
+   ↓
+paused
+```
+
+and verifies that the returned subscriber contains:
+
+```text
+status = paused
+```
+
+---
+
+# Subscription Tests
+
+## Create Subscription
+
+The subscription test creates a subscriber and then attaches an event type to it.
+
+Example:
+
+```text
+Subscriber
+    │
+    └── order.created
+```
+
+The test verifies:
+
+* HTTP status `201`
+* Correct `subscriber_id`
+* Correct `event_type`
+* Subscription is active
+
+The resulting relationship is:
+
+```text
+Subscriber
+     │
+     ▼
+Subscription
+     │
+     └── event_type = order.created
+```
+
+---
+
+## Duplicate Subscription Test
+
+The database contains a unique constraint on:
+
+```text
+(subscriber_id, event_type)
+```
+
+The test verifies that attempting to create the same subscription twice is rejected.
+
+Flow:
+
+```text
+First subscription
+        │
+        ▼
+201 Created
+```
+
+Second subscription:
+
+```text
+Same subscriber
+       +
+Same event type
+       │
+       ▼
+Duplicate detected
+       │
+       ▼
+409 Conflict
+```
+
+The test verifies the expected error:
+
+```text
+Subscriber is already subscribed to this event type
+```
+
+This ensures that the same subscriber cannot accidentally register for the same event type multiple times.
+
+---
+
+# Complete Test Suite
+
+The complete test suite currently contains:
+
+```text
+tests/test_events.py
+    ├── test_root
+    └── test_event_idempotency
+
+tests/test_subscribers.py
+    ├── test_create_subscriber
+    ├── test_list_subscribers
+    └── test_update_subscriber
+
+tests/test_subscriptions.py
+    ├── test_create_subscription
+    └── test_duplicate_subscription_rejected
+```
+
+All tests were successfully executed:
+
+```text
+7 passed ✅
+```
+
+The full test suite can be executed using:
+
+```bash
+docker compose exec api pytest -v
+```
+
+---
+
+# Schema Documentation
+
+A dedicated schema documentation file was created:
+
+```text
+docs/schema.md
+```
+
+The documentation explains the five main database entities:
+
+```text
+Subscriber
+Subscription
+Event
+DeliveryAttempt
+DeadLetter
+```
+
+It also documents their relationships and the purpose of each table.
+
+---
+
+# Event → DeliveryAttempt Relationship
+
+The core delivery relationship is:
+
+```text
+Event
+  │
+  └──< DeliveryAttempt
+             │
+             └── Subscriber
+```
+
+An `Event` represents a webhook event received by the gateway.
+
+A `DeliveryAttempt` represents an individual attempt to deliver that event to a particular subscriber.
+
+For example:
+
+```text
+Event: order.created
+       │
+       ├── Attempt 1 → Order Service
+       │
+       ├── Attempt 2 → Order Service
+       │
+       └── Attempt 3 → Order Service
+```
+
+This structure allows the system to record multiple attempts for the same event/subscriber pair when retry functionality is introduced.
+
+---
+
+# Subscriber → Subscription Relationship
+
+A subscriber can have multiple subscriptions:
+
+```text
+Subscriber
+    │
+    ├── Subscription → order.created
+    │
+    ├── Subscription → payment.completed
+    │
+    └── Subscription → user.created
+```
+
+The `Subscription` table determines which event types a subscriber is interested in.
+
+The database prevents duplicate subscriptions using:
+
+```text
+(subscriber_id, event_type)
+```
+
+as a unique combination.
+
+---
+
+# DeadLetter Relationship
+
+A delivery that eventually reaches permanent failure handling can be represented by:
+
+```text
+Event
+  │
+  └──> DeadLetter
+          │
+          └── Subscriber
+```
+
+The `DeadLetter` table stores:
+
+```text
+event_id
+subscriber_id
+failed_reason
+moved_at
+```
+
+The actual retry exhaustion and dead-letter processing will be implemented in later weeks.
+
+---
+
+# Overall Database Relationship
+
+The overall relationship can be represented as:
+
+```text
+                         ┌──────────────┐
+                         │     Event    │
+                         └──────┬───────┘
+                                │
+                    ┌───────────┴───────────┐
+                    │                       │
+                    ▼                       ▼
+          ┌──────────────────┐     ┌────────────────┐
+          │ DeliveryAttempt  │     │   DeadLetter   │
+          └────────┬─────────┘     └───────┬────────┘
+                   │                       │
+                   ▼                       ▼
+              ┌───────────┐          ┌───────────┐
+              │ Subscriber│          │ Subscriber│
+              └─────┬─────┘          └───────────┘
+                    │
+                    ▼
+              ┌─────────────┐
+              │ Subscription│
+              └─────────────┘
+```
+
+The schema separates the responsibilities of:
+
+```text
+Event
+  → What happened
+
+Subscriber
+  → Who receives events
+
+Subscription
+  → Which event types a subscriber wants
+
+DeliveryAttempt
+  → What happened during delivery
+
+DeadLetter
+  → Which deliveries permanently failed
+```
+
+---
+
+# Week 1 Day 5 Checkpoint
+
+```text
+Week 1 — Day 5 ✅
+
+Automated Testing
+      │
+      ├── Event tests
+      │     ├── Root endpoint
+      │     └── Idempotency
+      │
+      ├── Subscriber tests
+      │     ├── Create
+      │     ├── List
+      │     └── Update
+      │
+      └── Subscription tests
+            ├── Create
+            └── Duplicate prevention
+
+            ↓
+
+        7 tests passed
+
+            ↓
+
+Schema Documentation
+      │
+      └── docs/schema.md
+```
+
+---
+
+# Week 1 Completion Status
+
+```text
+Week 1 — Day 1–2
+    ✅ Database base
+    ✅ Database engine
+    ✅ Session factory
+    ✅ Subscriber model
+    ✅ Subscription model
+    ✅ Event model
+    ✅ DeliveryAttempt model
+    ✅ DeadLetter model
+    ✅ Relationships
+    ✅ Unique constraints
+    ✅ Alembic migration
+    ✅ PostgreSQL schema
+    ✅ Demo seed data
+
+Week 1 — Day 3
+    ✅ POST /events/
+    ✅ Event validation
+    ✅ Event persistence
+    ✅ Default pending status
+    ✅ Idempotency handling
+    ✅ Concurrency-safe duplicate handling
+    ✅ GET /events/{id}
+    ✅ GET /events/
+    ✅ Event type filtering
+    ✅ Status filtering
+    ✅ Pagination
+    ✅ Newest-first ordering
+
+Week 1 — Day 4
+    ✅ Subscriber creation
+    ✅ Secure secret generation
+    ✅ Secret returned only during creation
+    ✅ Secret hidden from normal responses
+    ✅ Subscription creation
+    ✅ Duplicate subscription prevention
+    ✅ Subscriber listing
+    ✅ Subscriber status update
+    ✅ Pause subscriber
+    ✅ Resume subscriber
+
+Week 1 — Day 5
+    ✅ Pytest setup
+    ✅ Event idempotency test
+    ✅ Subscriber CRUD tests
+    ✅ Subscription tests
+    ✅ Duplicate subscription test
+    ✅ 7 tests passing
+    ✅ docs/schema.md
+```
+
+---
+
+# Current Completion Status
+
+```text
+Phase 0 — Setup
+    ✅ Docker Compose
+    ✅ PostgreSQL
+    ✅ Redis
+    ✅ FastAPI
+    ✅ Next.js
+    ✅ Alembic
+
+Week 1 — Day 1–2
+    ✅ Schema + Models
+
+Week 1 — Day 3
+    ✅ Event Ingest API
+
+Week 1 — Day 4
+    ✅ Subscriber Management
+
+Week 1 — Day 5
+    ✅ Tests + Documentation
+```
+
+## Current Position
+
+**Week 1 is now COMPLETED ✅**
+
+The gateway can currently:
+
+```text
+Register Subscriber
+       │
+       ▼
+Create Subscription
+       │
+       ▼
+Submit Event
+       │
+       ▼
+Persist Event
+       │
+       ▼
+Prevent Duplicate Events
+       │
+       ▼
+Query Event
+```
+
+The project currently has **no actual webhook delivery yet**.
+
+That is intentional and follows the implementation plan:
+
+> End of Week 1 checkpoint: You can register a subscriber, submit an event, and query it back. Nothing is delivered yet — that's fine, that's Week 2.
+
+---
+
+# Next Step — Week 2
+
+The next phase is:
+
+```text
+Week 2 — Delivery Pipeline + HMAC Signing
+```
+
+The first step will be publishing the event to a Redis Stream:
+
+```text
+POST /events
+      │
+      ▼
+PostgreSQL
+      │
+      ▼
+Redis Stream
+      │
+      ▼
+Delivery Worker
+      │
+      ▼
+Subscriber Endpoint
+```
+
+Week 2 will introduce the actual webhook delivery pipeline while preserving the correctness guarantees implemented during Week 1.
