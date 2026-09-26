@@ -9,11 +9,17 @@ from app.db.session import get_db
 from app.models.event import Event
 from app.schemas.event import EventCreate, EventResponse
 
+from app.redis.publisher import publish_event
+
 router = APIRouter(prefix="/events", tags=["Events"])
 
 
-@router.post("/",response_model=EventResponse,)
-def create_event(event: EventCreate, response: Response, db: Session = Depends(get_db)):
+@router.post("/", response_model=EventResponse)
+async def create_event(
+    event: EventCreate,
+    response: Response,
+    db: Session = Depends(get_db)
+):
     # First check for an existing event
     stmt = select(Event).where(
         Event.idempotency_key == event.idempotency_key
@@ -35,6 +41,9 @@ def create_event(event: EventCreate, response: Response, db: Session = Depends(g
         db.commit()
         db.refresh(db_event)
 
+        # Publish only newly created events
+        await publish_event(str(db_event.id))
+
         response.status_code = status.HTTP_201_CREATED
         return db_event
 
@@ -52,7 +61,6 @@ def create_event(event: EventCreate, response: Response, db: Session = Depends(g
 
         response.status_code = status.HTTP_200_OK
         return existing_event
-
 
 @router.get("/{event_id}", response_model=EventResponse)
 def get_event(
