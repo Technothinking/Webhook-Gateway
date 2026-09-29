@@ -32,6 +32,23 @@ services:
       - postgres
       - redis
 
+  worker:
+    build:
+      context: ./api
+    container_name: webhook-worker
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      WORKER_NAME: worker-1
+      PYTHONPATH: /app
+    volumes:
+      - ./api:/app
+      - ./workers:/worker
+    command: python -u /worker/worker.py
+    depends_on:
+      - postgres
+      - redis
+
   dashboard:
     build:
       context: ./dashboard

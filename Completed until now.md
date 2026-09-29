@@ -2705,3 +2705,829 @@ Subscriber Endpoint
 ```
 
 Week 2 will introduce the actual webhook delivery pipeline while preserving the correctness guarantees implemented during Week 1.
+
+# Week 2 — Delivery Pipeline + HMAC Signing
+
+## Week 2 — Day 1: Redis Stream Publishing
+
+### Status: COMPLETED ✅
+
+Week 2 Day 1 introduced Redis Streams into the event ingestion pipeline.
+
+The goal was to ensure that every newly created event is published to a Redis Stream after it has been successfully persisted in PostgreSQL.
+
+The resulting flow is:
+
+```text
+POST /events
+      │
+      ▼
+PostgreSQL
+      │
+      │ Event persisted successfully
+      ▼
+Redis Stream
+      │
+      ▼
+Delivery Worker
+```
+
+---
+
+## Redis Configuration
+
+Redis was already running as part of the Docker Compose infrastructure:
+
+```yaml
+redis:
+  image: redis:7-alpine
+  container_name: webhook-redis
+  ports:
+    - "6379:6379"
+```
+
+The API receives the Redis connection URL through the environment:
+
+```env
+REDIS_URL=redis://redis:6379
+```
+
+The Redis Python package was added to the API requirements.
+
+Redis connectivity was verified successfully using:
+
+```bash
+docker compose exec redis redis-cli ping
+```
+
+which returned:
+
+```text
+PONG
+```
+
+The Redis Python package was also verified inside the API container.
+
+---
+
+## Redis Client
+
+A Redis client was created at:
+
+```text
+api/app/redis/client.py
+```
+
+The client uses `redis.asyncio` so that Redis operations can be performed asynchronously from the FastAPI application.
+
+```python
+import os
+
+import redis.asyncio as redis
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
+
+redis_client = redis.from_url(
+    REDIS_URL,
+    decode_responses=True
+)
+```
+
+---
+
+## Event Stream Publisher
+
+A publisher was created at:
+
+```text
+api/app/redis/publisher.py
+```
+
+The Redis Stream name is:
+
+```text
+webhook_events
+```
+
+New events are published using:
+
+```python
+await redis_client.xadd(
+    EVENT_STREAM,
+    {
+        "event_id": event_id
+    }
+)
+```
+
+Only the `event_id` is placed into the stream.
+
+The complete event payload remains in PostgreSQL.
+
+This keeps Redis responsible for **event notification/work distribution**, while PostgreSQL remains the source of truth for event data.
+
+---
+
+## POST /events Integration
+
+The existing event ingestion endpoint was updated so that newly created events are published to Redis after successful database persistence.
+
+The flow is:
+
+```text
+Create Event
+     │
+     ▼
+db.commit()
+     │
+     ▼
+db.refresh()
+     │
+     ▼
+Publish event_id to Redis
+     │
+     ▼
+Return 201 Created
+```
+
+The important part is that Redis publishing occurs only for **newly created events**.
+
+Duplicate/idempotent requests do not publish the event again.
+
+Therefore:
+
+```text
+New Event
+    └──► PostgreSQL + Redis Stream
+
+Duplicate Event
+    └──► PostgreSQL lookup only
+          └──► No duplicate Redis message
+```
+
+This preserves the idempotency behavior implemented during Week 1.
+
+---
+
+## Redis Stream Verification
+
+The Redis Stream was verified using:
+
+```bash
+docker compose exec redis redis-cli XRANGE webhook_events - +
+```
+
+The stream contained messages with the structure:
+
+```text
+event_id
+    │
+    └── UUID of the persisted PostgreSQL event
+```
+
+The API was also tested by creating new events and confirming that their IDs appeared in the Redis Stream.
+
+---
+
+# Week 2 — Day 2–3: Delivery Worker
+
+## Status: COMPLETED ✅
+
+Week 2 Day 2–3 introduced the background delivery worker.
+
+The worker consumes event IDs from the Redis Stream using a Redis Consumer Group and performs the first version of actual webhook delivery.
+
+The implemented flow is:
+
+```text
+Redis Stream
+      │
+      ▼
+Consumer Group
+      │
+      ▼
+Delivery Worker
+      │
+      ▼
+Load Event from PostgreSQL
+      │
+      ▼
+Find Matching Subscriptions
+      │
+      ▼
+Find Active Subscribers
+      │
+      ▼
+Generate HMAC Signature
+      │
+      ▼
+HTTP POST
+      │
+      ▼
+Create DeliveryAttempt
+      │
+      ▼
+ACK Redis Message
+```
+
+---
+
+## Worker Location
+
+The worker is intentionally kept separate from the FastAPI application:
+
+```text
+webhook-gateway/
+├── api/
+│   └── app/
+│
+├── workers/
+│   └── worker.py
+│
+├── dashboard/
+└── demo-subscriber/
+```
+
+The worker source file is:
+
+```text
+workers/worker.py
+```
+
+The `workers/` directory is at the project root rather than inside `api/`.
+
+---
+
+## Docker Worker Service
+
+A dedicated worker service was added to Docker Compose.
+
+The worker uses the API image so that it can access the existing application models and database configuration.
+
+The important configuration is:
+
+```yaml
+worker:
+  build:
+    context: ./api
+  container_name: webhook-worker
+  environment:
+    DATABASE_URL: ${DATABASE_URL}
+    REDIS_URL: ${REDIS_URL}
+    WORKER_NAME: worker-1
+    PYTHONPATH: /app
+  volumes:
+    - ./api:/app
+    - ./workers:/worker
+  command: python -u /worker/worker.py
+  depends_on:
+    - postgres
+    - redis
+```
+
+`PYTHONPATH=/app` allows the worker to import the existing application package:
+
+```python
+from app.db.session import SessionLocal
+```
+
+The worker uses:
+
+```text
+/app
+```
+
+for the FastAPI application code and:
+
+```text
+/worker
+```
+
+for the worker code.
+
+The `-u` option is used so that worker output is written to Docker logs immediately.
+
+---
+
+# Redis Consumer Group
+
+The worker uses the Redis Consumer Group:
+
+```text
+delivery_workers
+```
+
+The stream is:
+
+```text
+webhook_events
+```
+
+The worker creates the consumer group if it does not already exist.
+
+If the group already exists, the worker continues normally.
+
+The worker identifies itself as:
+
+```text
+worker-1
+```
+
+using the `WORKER_NAME` environment variable.
+
+---
+
+## Event Consumption
+
+The worker uses:
+
+```python
+XREADGROUP
+```
+
+to consume messages from the Redis Stream.
+
+The worker waits for new messages and receives the `event_id` stored in each Redis message.
+
+For example:
+
+```text
+Received event: 00a1729e-9f6b-486b-9c64-16b563af297c
+(message_id=1790573350622-0)
+```
+
+After successfully processing the event, the worker acknowledges the Redis message:
+
+```text
+ACKed message: 1790573350622-0
+```
+
+The worker was tested successfully with newly created events.
+
+---
+
+## Redis Idle Timeout Handling
+
+`XREADGROUP` uses a blocking read:
+
+```python
+block=5000
+```
+
+When the stream remains idle, Redis/redis-py can raise a timeout exception.
+
+The worker handles this using:
+
+```python
+from redis.exceptions import TimeoutError
+```
+
+and:
+
+```python
+except TimeoutError:
+    continue
+```
+
+This prevents the worker from exiting when there are temporarily no new events.
+
+---
+
+# PostgreSQL Event Loading
+
+After receiving an `event_id`, the worker loads the corresponding event from PostgreSQL using the existing SQLAlchemy models.
+
+The worker uses:
+
+```text
+api/app/db/session.py
+```
+
+and:
+
+```python
+SessionLocal
+```
+
+to create a database session.
+
+The event is retrieved using its UUID.
+
+If the event cannot be found, the worker logs the situation and does not attempt delivery.
+
+---
+
+# Subscription Matching
+
+After loading the event, the worker searches for subscriptions matching:
+
+```text
+Subscription.event_type == Event.event_type
+```
+
+Only subscriptions satisfying:
+
+```text
+is_active = true
+```
+
+are selected.
+
+The subscriber must also have:
+
+```text
+status = active
+```
+
+Therefore, the delivery worker only sends events to subscribers that are currently eligible to receive them.
+
+The relationship is:
+
+```text
+Event
+  │
+  │ event_type
+  ▼
+Subscription
+  │
+  │ subscriber_id
+  ▼
+Subscriber
+```
+
+---
+
+# HMAC-SHA256 Signing
+
+The worker generates a signature for every webhook request.
+
+The signed content is:
+
+```text
+timestamp + "." + payload_json
+```
+
+The subscriber's secret is used as the HMAC key.
+
+The algorithm is:
+
+```text
+HMAC-SHA256
+```
+
+The resulting hexadecimal signature is sent using:
+
+```text
+X-Webhook-Signature
+```
+
+The timestamp is sent using:
+
+```text
+X-Webhook-Timestamp
+```
+
+The request also contains:
+
+```text
+Content-Type: application/json
+```
+
+The signing process is:
+
+```text
+Subscriber Secret
+       │
+       ▼
+HMAC-SHA256
+       │
+       │ timestamp + "." + payload_json
+       ▼
+Webhook Signature
+```
+
+The receiver will later verify this signature in the demo subscriber.
+
+---
+
+# HTTP Webhook Delivery
+
+The worker uses `httpx.AsyncClient` to send the webhook request.
+
+The request is sent using:
+
+```text
+POST
+```
+
+to the subscriber's configured:
+
+```text
+endpoint_url
+```
+
+The event payload is serialized as JSON before being sent.
+
+A request timeout of 10 seconds is currently used.
+
+---
+
+# DeliveryAttempt Persistence
+
+After attempting delivery, the worker creates a `DeliveryAttempt` record.
+
+The existing `DeliveryAttempt` model is used without changing the database schema.
+
+The recorded information includes:
+
+```text
+event_id
+subscriber_id
+attempt_number
+status
+http_status_code
+response_body
+latency_ms
+attempted_at
+```
+
+For the current Week 2 implementation:
+
+```text
+attempt_number = 1
+```
+
+No retry scheduling has been implemented yet.
+
+Retries are intentionally reserved for Week 3.
+
+---
+
+## Successful Delivery
+
+A response with an HTTP status code in the range:
+
+```text
+200–299
+```
+
+is recorded as:
+
+```text
+status = success
+```
+
+The HTTP status code, response body, and delivery latency are also stored.
+
+---
+
+## Failed Delivery
+
+A non-2xx HTTP response is recorded as:
+
+```text
+status = failed
+```
+
+The HTTP status code and response body are stored.
+
+Network/request errors are also recorded as failed delivery attempts.
+
+The worker does not crash when a subscriber cannot be reached.
+
+---
+
+# Delivery Verification
+
+The worker was tested against an existing subscriber endpoint:
+
+```text
+https://example.com/webhooks/notifications
+```
+
+The worker successfully performed the delivery:
+
+```text
+Received event: 97e25653-2ca3-40c2-a7f9-0570367efbf2
+(message_id=1790661483890-0)
+
+Delivered event 97e25653-2ca3-40c2-a7f9-0570367efbf2
+to https://example.com/webhooks/notifications
+status=405
+latency=96ms
+
+ACKed message: 1790661483890-0
+```
+
+The `405 Method Not Allowed` response confirmed that the HTTP endpoint was reached and responded to the request.
+
+The response was correctly recorded as a failed `DeliveryAttempt`.
+
+The database entry was manually verified and contained the expected:
+
+```text
+event_id
+subscriber_id
+attempt_number = 1
+status = failed
+http_status_code = 405
+latency_ms
+```
+
+---
+
+# Current Week 2 Architecture
+
+The implementation now has the following pipeline:
+
+```text
+                         ┌──────────────────┐
+                         │     Producer     │
+                         └────────┬─────────┘
+                                  │
+                                  │ POST /events
+                                  ▼
+                         ┌──────────────────┐
+                         │   FastAPI API    │
+                         └────────┬─────────┘
+                                  │
+                    ┌─────────────┴─────────────┐
+                    │                           │
+                    ▼                           ▼
+             ┌──────────────┐           ┌──────────────┐
+             │  PostgreSQL  │           │ Redis Stream │
+             │              │           │webhook_events│
+             └──────────────┘           └──────┬───────┘
+                                               │
+                                               ▼
+                                      ┌─────────────────┐
+                                      │ Consumer Group  │
+                                      │delivery_workers │
+                                      └────────┬────────┘
+                                               │
+                                               ▼
+                                      ┌─────────────────┐
+                                      │ Delivery Worker │
+                                      └────────┬────────┘
+                                               │
+                                               ▼
+                                      ┌─────────────────┐
+                                      │   Subscription  │
+                                      │    Matching    │
+                                      └────────┬────────┘
+                                               │
+                                               ▼
+                                      ┌─────────────────┐
+                                      │    Subscriber   │
+                                      │  HMAC Signing   │
+                                      └────────┬────────┘
+                                               │
+                                               │ HTTP POST
+                                               ▼
+                                      ┌─────────────────┐
+                                      │    Subscriber   │
+                                      │    Endpoint     │
+                                      └────────┬────────┘
+                                               │
+                                               ▼
+                                      ┌─────────────────┐
+                                      │DeliveryAttempt  │
+                                      └─────────────────┘
+```
+
+---
+
+# Week 2 — Day 1–3 Completion Checklist
+
+```text
+Week 2 — Day 1
+    ✅ Redis Stream configuration
+    ✅ Redis Python client
+    ✅ Event publisher
+    ✅ webhook_events stream
+    ✅ Publish event_id after successful persistence
+    ✅ Duplicate events do not create duplicate Redis messages
+    ✅ Redis Stream verified
+
+Week 2 — Day 2–3
+    ✅ Delivery worker
+    ✅ Redis Consumer Group
+    ✅ delivery_workers consumer group
+    ✅ Worker event consumption
+    ✅ Redis ACK handling
+    ✅ Redis idle timeout handling
+    ✅ PostgreSQL event loading
+    ✅ Active subscription matching
+    ✅ Active subscriber filtering
+    ✅ HMAC-SHA256 signing
+    ✅ X-Webhook-Signature header
+    ✅ X-Webhook-Timestamp header
+    ✅ HTTP POST delivery
+    ✅ Delivery latency measurement
+    ✅ DeliveryAttempt persistence
+    ✅ Successful delivery handling
+    ✅ Failed delivery handling
+    ✅ Network error handling
+    ✅ End-to-end worker delivery verified
+```
+
+---
+
+# Important Week 2 Checkpoint
+
+The project has now progressed from simply accepting and storing events to actually processing them asynchronously.
+
+The current flow is:
+
+```text
+Submit Event
+     │
+     ▼
+Persist in PostgreSQL
+     │
+     ▼
+Publish event_id
+     │
+     ▼
+Redis Stream
+     │
+     ▼
+Delivery Worker
+     │
+     ▼
+Match Subscriber
+     │
+     ▼
+Sign Payload
+     │
+     ▼
+HTTP POST
+     │
+     ▼
+Record DeliveryAttempt
+     │
+     ▼
+ACK Message
+```
+
+At this point:
+
+* Events are published asynchronously through Redis Streams.
+* A dedicated worker consumes events using a Redis Consumer Group.
+* Events are loaded from PostgreSQL before delivery.
+* Active subscriptions determine which subscribers receive an event.
+* Webhook requests are signed using HMAC-SHA256.
+* Delivery attempts are persisted.
+* HTTP failures are recorded.
+* Redis messages are acknowledged after delivery processing.
+
+**Retries, retry scheduling, circuit breaking, and dead-letter handling have not been implemented yet.**
+
+These are intentionally reserved for **Week 3**.
+
+---
+
+# Current Position
+
+```text
+Phase 0 — Setup
+    ✅ Docker Compose
+    ✅ PostgreSQL
+    ✅ Redis
+    ✅ FastAPI
+    ✅ Next.js
+    ✅ Alembic
+
+Week 1 — Day 1–2
+    ✅ Schema + Models
+
+Week 1 — Day 3
+    ✅ Event Ingest API
+
+Week 1 — Day 4
+    ✅ Subscriber Management
+
+Week 1 — Day 5
+    ✅ Tests + Documentation
+
+Week 2 — Day 1
+    ✅ Redis Stream Publishing
+
+Week 2 — Day 2–3
+    ✅ Delivery Worker
+    ✅ Redis Consumer Group
+    ✅ Event Loading
+    ✅ Subscription Matching
+    ✅ HMAC Signing
+    ✅ HTTP Delivery
+    ✅ DeliveryAttempt Logging
+```
+
+## Current Position: Week 2 — Day 3 COMPLETED ✅
+
+The next implementation step is:
+
+**Week 2 → Day 4: Demo Subscriber + HMAC Verification**
+
+The demo subscriber will provide a controlled endpoint for verifying the complete signed webhook flow and will also include an outage toggle for later retry/circuit-breaker testing.
+
