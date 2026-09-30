@@ -48,6 +48,17 @@ services:
     depends_on:
       - postgres
       - redis
+  
+  demo-subscriber:
+    build:
+      context: ./demo-subscriber
+    container_name: webhook-demo-subscriber
+    environment:
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET}
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./demo-subscriber:/app
 
   dashboard:
     build:
