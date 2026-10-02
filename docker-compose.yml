@@ -49,6 +49,22 @@ services:
       - postgres
       - redis
   
+  retry-scheduler:
+    build:
+      context: ./api
+    container_name: webhook-retry-scheduler
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHONPATH: /app
+    volumes:
+      - ./api:/app
+      - ./workers:/worker
+    command: python -u /worker/retry_scheduler.py
+    depends_on:
+      - postgres
+      - redis
+
   demo-subscriber:
     build:
       context: ./demo-subscriber

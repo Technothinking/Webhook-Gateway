@@ -4299,3 +4299,560 @@ The project has now completed the entire **Week 2 — Delivery Pipeline (Happy P
 The next implementation phase is:
 
 **Week 3 → Retries + Backoff + Circuit Breaker + Dead-Letter Handling**
+
+# Week 3 — Day 1–2: Retry with Exponential Backoff + Jitter
+
+## Status: COMPLETED ✅
+
+Week 3 Day 1–2 introduced the retry mechanism for failed webhook deliveries.
+
+The gateway can now automatically retry failed deliveries without blocking the delivery worker, using exponential backoff, jitter, per-subscriber retry tracking, and a dedicated retry scheduler.
+
+---
+
+# Retry Architecture
+
+The retry flow is:
+
+```text
+Webhook Delivery
+      │
+      ▼
+HTTP Response / Network Error
+      │
+      ├── 2xx ───────────────► Success
+      │
+      └── Non-2xx / Error
+                │
+                ▼
+        Calculate Retry Delay
+                │
+                ▼
+        Store DeliveryAttempt
+        status = pending_retry
+                │
+                ▼
+        next_retry_at
+                │
+                ▼
+        Retry Scheduler
+                │
+        Retry becomes due
+                │
+                ▼
+        Redis Stream
+                │
+                ▼
+        Delivery Worker
+                │
+                ▼
+        Retry Specific
+        Subscriber
+```
+
+Retries are tracked independently for each:
+
+```text
+Event + Subscriber
+```
+
+This ensures that one subscriber's failures do not interfere with delivery attempts for another subscriber.
+
+---
+
+# Retry Configuration
+
+The worker uses the following retry schedule:
+
+```python
+RETRY_DELAYS = [1, 5, 30, 300, 1800]
+JITTER_MAX_SECONDS = 1
+```
+
+The corresponding retry delays are:
+
+```text
+Attempt 1 → approximately 1 second
+Attempt 2 → approximately 5 seconds
+Attempt 3 → approximately 30 seconds
+Attempt 4 → approximately 5 minutes
+Attempt 5 → approximately 30 minutes
+```
+
+Random jitter is added to prevent multiple failed deliveries from being retried at exactly the same time.
+
+The retry delay is calculated using the attempt number and is capped by the configured maximum delay.
+
+---
+
+# Delivery Failure Handling
+
+The worker now treats the following conditions as delivery failures:
+
+```text
+Non-2xx HTTP response
+        │
+        └──► Retry
+
+HTTP request/network error
+        │
+        └──► Retry
+```
+
+Retries are **not performed inline**.
+
+Instead, the failed attempt is persisted with:
+
+```text
+status = pending_retry
+next_retry_at = calculated retry time
+```
+
+This allows the worker to immediately finish processing the current Redis message instead of waiting for the retry delay.
+
+---
+
+# DeliveryAttempt Retry Tracking
+
+The existing `DeliveryAttempt` model was extended through its existing:
+
+```text
+next_retry_at
+```
+
+field.
+
+Each retry attempt records:
+
+```text
+event_id
+subscriber_id
+attempt_number
+status
+http_status_code
+response_body
+latency_ms
+attempted_at
+next_retry_at
+```
+
+Example:
+
+```text
+Attempt 1
+    status = pending_retry
+    next_retry_at = now + ~1 second
+
+Attempt 2
+    status = pending_retry
+    next_retry_at = now + ~5 seconds
+
+Attempt 3
+    status = pending_retry
+    next_retry_at = now + ~30 seconds
+```
+
+Successful deliveries continue to record:
+
+```text
+status = success
+next_retry_at = NULL
+```
+
+---
+
+# Per-Subscriber Retry Handling
+
+Retry messages contain both:
+
+```text
+event_id
+subscriber_id
+```
+
+The initial event message contains only:
+
+```text
+event_id
+```
+
+This allows the worker to distinguish between:
+
+```text
+Initial delivery
+```
+
+and:
+
+```text
+Retry delivery for a specific subscriber
+```
+
+For example:
+
+```text
+Initial Event
+     │
+     ├── Subscriber A → Success
+     │
+     └── Subscriber B → Failure
+                         │
+                         ▼
+                    Retry Subscriber B
+```
+
+Subscriber A does not get unnecessarily retried.
+
+---
+
+# Retry Scheduler
+
+A separate worker process was introduced:
+
+```text
+workers/retry_scheduler.py
+```
+
+The scheduler continuously polls PostgreSQL for delivery attempts where:
+
+```text
+status = pending_retry
+```
+
+and:
+
+```text
+next_retry_at <= current_time
+```
+
+When a retry becomes due, the scheduler publishes a new Redis Stream message containing:
+
+```text
+event_id
+subscriber_id
+```
+
+The attempt is then marked:
+
+```text
+status = retry_queued
+```
+
+The Redis Stream message is subsequently consumed by the normal delivery worker.
+
+---
+
+# Retry Scheduler Flow
+
+```text
+PostgreSQL
+     │
+     ▼
+Find pending_retry
+where next_retry_at <= now
+     │
+     ▼
+Publish to Redis Stream
+     │
+     ├── event_id
+     └── subscriber_id
+     │
+     ▼
+Mark attempt retry_queued
+     │
+     ▼
+Redis Consumer Group
+     │
+     ▼
+Delivery Worker
+     │
+     ▼
+Retry Subscriber
+```
+
+The scheduler polls approximately once per second.
+
+A limit is also applied to the number of retry records processed in one polling cycle.
+
+---
+
+# Redis ACK Handling
+
+Retry messages use the same Redis Consumer Group mechanism as normal deliveries.
+
+After the worker processes the retry:
+
+```text
+Retry Delivery
+      │
+      ▼
+Record DeliveryAttempt
+      │
+      ▼
+Redis ACK
+```
+
+This maintains the existing at-least-once delivery behavior.
+
+---
+
+# Maximum Retry Handling
+
+A maximum retry boundary was added using:
+
+```python
+MAX_RETRY_ATTEMPTS = len(RETRY_DELAYS)
+```
+
+With the current configuration:
+
+```text
+MAX_RETRY_ATTEMPTS = 5
+```
+
+The behavior is:
+
+```text
+Attempt 1 → failure → retry
+Attempt 2 → failure → retry
+Attempt 3 → failure → retry
+Attempt 4 → failure → retry
+Attempt 5 → failure → retries exhausted
+```
+
+After the final allowed attempt fails:
+
+```text
+status = failed
+next_retry_at = NULL
+```
+
+No additional retry is scheduled.
+
+Actual Dead Letter creation is intentionally reserved for:
+
+```text
+Week 3 — Day 4
+```
+
+---
+
+# Retry Exhaustion Flow
+
+```text
+Attempt 5
+    │
+    ▼
+Delivery Failure
+    │
+    ▼
+Maximum Attempts Reached
+    │
+    ▼
+status = failed
+    │
+    ▼
+next_retry_at = NULL
+    │
+    ▼
+No Further Retry
+```
+
+This prevents the system from retrying a permanently failing endpoint indefinitely.
+
+---
+
+# Testing and Verification
+
+The retry system was tested using a deliberately failing subscriber endpoint.
+
+The retry delays were temporarily shortened for testing:
+
+```text
+[1, 2, 3, 4, 5]
+```
+
+The delivery successfully progressed through:
+
+```text
+Attempt 1
+    ↓
+Retry
+
+Attempt 2
+    ↓
+Retry
+
+Attempt 3
+    ↓
+Retry
+
+Attempt 4
+    ↓
+Retry
+
+Attempt 5
+    ↓
+Retries Exhausted
+```
+
+The system correctly stopped after the fifth attempt.
+
+The production retry configuration was then restored to:
+
+```text
+[1, 5, 30, 300, 1800]
+```
+
+---
+
+# Week 3 — Day 1–2 Completion Checklist
+
+```text
+Week 3 — Day 1–2
+
+    ✅ Retry configuration
+    ✅ Exponential backoff
+    ✅ Random jitter
+    ✅ Non-2xx retry handling
+    ✅ Network error retry handling
+    ✅ Per-event retry tracking
+    ✅ Per-subscriber retry tracking
+    ✅ next_retry_at handling
+    ✅ pending_retry status
+    ✅ Retry scheduler
+    ✅ PostgreSQL retry polling
+    ✅ Redis retry publishing
+    ✅ Retry-specific subscriber routing
+    ✅ retry_queued status
+    ✅ Redis ACK for retry messages
+    ✅ Maximum retry attempts
+    ✅ Retry exhaustion handling
+    ✅ No retry after maximum attempts
+    ✅ Retry flow manually verified
+```
+
+---
+
+# Important Week 3 Checkpoint
+
+The gateway now supports asynchronous retries for failed webhook deliveries.
+
+The delivery pipeline has evolved from:
+
+```text
+Event
+  │
+  ▼
+Redis Stream
+  │
+  ▼
+Delivery Worker
+  │
+  ▼
+HTTP Delivery
+  │
+  ▼
+Success / Failure
+```
+
+to:
+
+```text
+Event
+  │
+  ▼
+Redis Stream
+  │
+  ▼
+Delivery Worker
+  │
+  ▼
+HTTP Delivery
+  │
+  ├──────────────► Success
+  │
+  └── Failure
+       │
+       ▼
+   pending_retry
+       │
+       ▼
+   next_retry_at
+       │
+       ▼
+ Retry Scheduler
+       │
+       ▼
+ Redis Stream
+       │
+       ▼
+ Delivery Worker
+       │
+       ▼
+ Retry Delivery
+```
+
+The system no longer performs retries inline and will not retry a permanently failing delivery indefinitely.
+
+---
+
+# Current Position
+
+```text
+Phase 0 — Setup
+    ✅ Docker Compose
+    ✅ PostgreSQL
+    ✅ Redis
+    ✅ FastAPI
+    ✅ Next.js
+    ✅ Alembic
+
+Week 1 — Day 1–2
+    ✅ Schema + Models
+
+Week 1 — Day 3
+    ✅ Event Ingest API
+
+Week 1 — Day 4
+    ✅ Subscriber Management
+
+Week 1 — Day 5
+    ✅ Tests + Documentation
+
+Week 2 — Day 1
+    ✅ Redis Stream Publishing
+
+Week 2 — Day 2–3
+    ✅ Delivery Worker
+    ✅ Redis Consumer Group
+    ✅ Event Loading
+    ✅ Subscription Matching
+    ✅ HMAC Signing
+    ✅ HTTP Delivery
+    ✅ DeliveryAttempt Logging
+
+Week 2 — Day 4
+    ✅ Demo Subscriber
+    ✅ HMAC Verification
+    ✅ Outage Toggle
+
+Week 2 — Day 5
+    ✅ Tests
+    ✅ Final Integration Test
+    ✅ Week 2 Completed
+
+Week 3 — Day 1–2
+    ✅ Retry with Exponential Backoff
+    ✅ Jitter
+    ✅ Retry Scheduling
+    ✅ Per-Subscriber Retries
+    ✅ Maximum Retry Handling
+    ✅ Retry Exhaustion
+```
+
+## Current Position: Week 3 — Day 1–2 COMPLETED ✅
+
+The next implementation phase is:
+
+**Week 3 → Day 3: Circuit Breaker**

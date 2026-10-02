@@ -4,12 +4,13 @@ import hmac
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from uuid import UUID
 
 import httpx
 import redis.asyncio as redis
 from redis.exceptions import TimeoutError
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from app.db.session import SessionLocal
 from app.models.delivery_attempt import DeliveryAttempt
@@ -18,6 +19,7 @@ from app.models.subscriber import Subscriber
 from app.models.subscription import Subscription
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
 
@@ -33,6 +35,19 @@ redis_client = redis.from_url(
 )
 
 
+# Retry configuration
+RETRY_DELAYS = [
+    1,      # Attempt 1 -> retry after 1 second
+    5,      # Attempt 2 -> retry after 5 seconds
+    30,     # Attempt 3 -> retry after 30 seconds
+    300,    # Attempt 4 -> retry after 5 minutes
+    1800    # Attempt 5 -> retry after 30 minutes
+]
+
+JITTER_MAX_SECONDS = 1
+MAX_RETRY_ATTEMPTS = len(RETRY_DELAYS)
+
+
 async def create_consumer_group():
     try:
         await redis_client.xgroup_create(
@@ -42,6 +57,7 @@ async def create_consumer_group():
             mkstream=True
         )
         print(f"Created consumer group: {CONSUMER_GROUP}")
+
     except redis.ResponseError as exc:
         if "BUSYGROUP" in str(exc):
             print(f"Consumer group already exists: {CONSUMER_GROUP}")
@@ -54,6 +70,7 @@ def generate_signature(
     timestamp: str,
     payload_json: str
 ) -> str:
+
     signed_payload = f"{timestamp}.{payload_json}"
 
     signature = hmac.new(
@@ -65,20 +82,292 @@ def generate_signature(
     return signature
 
 
-async def deliver_event(event_id: str):
+def calculate_retry_delay(attempt_number: int) -> int:
+    """
+    Calculate retry delay using the configured exponential-style
+    retry schedule plus a small random jitter.
+    """
+
+    import random
+
+    index = attempt_number - 1
+
+    if index >= len(RETRY_DELAYS):
+        index = len(RETRY_DELAYS) - 1
+
+    base_delay = RETRY_DELAYS[index]
+
+    jitter = random.uniform(
+        0,
+        JITTER_MAX_SECONDS
+    )
+
+    return int(base_delay + jitter)
+
+
+async def get_next_attempt_number(
+    db,
+    event_id,
+    subscriber_id
+) -> int:
+
+    stmt = select(
+        func.max(DeliveryAttempt.attempt_number)
+    ).where(
+        DeliveryAttempt.event_id == event_id,
+        DeliveryAttempt.subscriber_id == subscriber_id
+    )
+
+    result = db.execute(stmt)
+
+    last_attempt = result.scalar()
+
+    if last_attempt is None:
+        return 1
+
+    return last_attempt + 1
+
+
+async def deliver_to_subscriber(
+    db,
+    event,
+    subscriber,
+    payload_json,
+    attempt_number
+):
+    timestamp = str(
+        int(datetime.now(timezone.utc).timestamp())
+    )
+
+    signature = generate_signature(
+        subscriber.secret,
+        timestamp,
+        payload_json
+    )
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Webhook-Signature": signature,
+        "X-Webhook-Timestamp": timestamp
+    }
+
+    start_time = time.perf_counter()
+
+    try:
+        async with httpx.AsyncClient() as client:
+
+            response = await client.post(
+                subscriber.endpoint_url,
+                content=payload_json,
+                headers=headers,
+                timeout=10.0
+            )
+
+        latency_ms = int(
+            (time.perf_counter() - start_time) * 1000
+        )
+
+        if 200 <= response.status_code < 300:
+
+            delivery_attempt = DeliveryAttempt(
+                event_id=event.id,
+                subscriber_id=subscriber.id,
+                attempt_number=attempt_number,
+                status="success",
+                http_status_code=response.status_code,
+                response_body=response.text,
+                latency_ms=latency_ms,
+                attempted_at=datetime.now(timezone.utc),
+                next_retry_at=None
+            )
+
+            db.add(delivery_attempt)
+            db.commit()
+
+            print(
+                f"Delivered event {event.id} to "
+                f"{subscriber.endpoint_url} "
+                f"attempt={attempt_number} "
+                f"status={response.status_code} "
+                f"latency={latency_ms}ms"
+            )
+
+            return
+
+        # Non-2xx response
+        if attempt_number >= MAX_RETRY_ATTEMPTS:
+            delivery_attempt = DeliveryAttempt(
+                event_id=event.id,
+                subscriber_id=subscriber.id,
+                attempt_number=attempt_number,
+                status="failed",
+                http_status_code=response.status_code,
+                response_body=response.text,
+                latency_ms=latency_ms,
+                attempted_at=datetime.now(timezone.utc),
+                next_retry_at=None
+            )
+
+            db.add(delivery_attempt)
+            db.commit()
+
+            print(
+                f"Delivery exhausted retries for event {event.id} "
+                f"to {subscriber.endpoint_url} "
+                f"attempt={attempt_number} "
+                f"status={response.status_code}"
+            )
+
+        else:
+            retry_delay = calculate_retry_delay(attempt_number)
+            next_retry_at = (
+                datetime.now(timezone.utc)
+                + timedelta(seconds=retry_delay)
+            )
+
+            delivery_attempt = DeliveryAttempt(
+                event_id=event.id,
+                subscriber_id=subscriber.id,
+                attempt_number=attempt_number,
+                status="pending_retry",
+                http_status_code=response.status_code,
+                response_body=response.text,
+                latency_ms=latency_ms,
+                attempted_at=datetime.now(timezone.utc),
+                next_retry_at=next_retry_at
+            )
+
+            db.add(delivery_attempt)
+            db.commit()
+
+            print(
+                f"Delivery failed for event {event.id} "
+                f"to {subscriber.endpoint_url} "
+                f"attempt={attempt_number} "
+                f"status={response.status_code} "
+                f"retry_in={retry_delay}s "
+                f"next_retry_at={next_retry_at}"
+            )
+
+    except httpx.RequestError as exc:
+
+        if attempt_number >= MAX_RETRY_ATTEMPTS:
+            delivery_attempt = DeliveryAttempt(
+                event_id=event.id,
+                subscriber_id=subscriber.id,
+                attempt_number=attempt_number,
+                status="failed",
+                http_status_code=None,
+                response_body=str(exc),
+                latency_ms=latency_ms,
+                attempted_at=datetime.now(timezone.utc),
+                next_retry_at=None
+            )
+
+            db.add(delivery_attempt)
+            db.commit()
+
+            print(
+                f"Delivery exhausted retries for event {event.id} "
+                f"to {subscriber.endpoint_url} "
+                f"attempt={attempt_number}: {exc}"
+            )
+
+        else:
+            retry_delay = calculate_retry_delay(attempt_number)
+            next_retry_at = (
+                datetime.now(timezone.utc)
+                + timedelta(seconds=retry_delay)
+            )
+
+            delivery_attempt = DeliveryAttempt(
+                event_id=event.id,
+                subscriber_id=subscriber.id,
+                attempt_number=attempt_number,
+                status="pending_retry",
+                http_status_code=None,
+                response_body=str(exc),
+                latency_ms=latency_ms,
+                attempted_at=datetime.now(timezone.utc),
+                next_retry_at=next_retry_at
+            )
+
+            db.add(delivery_attempt)
+            db.commit()
+
+            print(
+                f"Delivery failed for event {event.id} "
+                f"to {subscriber.endpoint_url} "
+                f"attempt={attempt_number} "
+                f"retry_in={retry_delay}s "
+                f"next_retry_at={next_retry_at}"
+            )
+
+
+async def deliver_event(
+    event_id: str,
+    retry_subscriber_id: str | None = None
+):
+
     db = SessionLocal()
 
     try:
+
         event = db.execute(
-            select(Event).where(Event.id == event_id)
+            select(Event).where(
+                Event.id == event_id
+            )
         ).scalar_one_or_none()
 
         if event is None:
-            print(f"Event not found: {event_id}")
+            print(
+                f"Event not found: {event_id}"
+            )
             return
 
+        if retry_subscriber_id:
+
+            subscriber = db.execute(
+                select(Subscriber).where(
+                    Subscriber.id == retry_subscriber_id
+                )
+            ).scalar_one_or_none()
+
+            if subscriber is None:
+                print(
+                    f"Subscriber not found: "
+                    f"{retry_subscriber_id}"
+                )
+                return
+
+            payload_json = json.dumps(
+                event.payload,
+                separators=(",", ":"),
+                sort_keys=True
+            )
+
+            attempt_number = await get_next_attempt_number(
+                db,
+                event.id,
+                subscriber.id
+            )
+
+            await deliver_to_subscriber(
+                db,
+                event,
+                subscriber,
+                payload_json,
+                attempt_number
+            )
+
+            return
+
+        # Initial delivery: fan out to all matching subscribers
         subscriptions = db.execute(
-            select(Subscription, Subscriber)
+            select(
+                Subscription,
+                Subscriber
+            )
             .join(
                 Subscriber,
                 Subscription.subscriber_id == Subscriber.id
@@ -91,10 +380,13 @@ async def deliver_event(event_id: str):
         ).all()
 
         if not subscriptions:
+
             print(
-                f"No active subscribers found for event "
-                f"{event_id} ({event.event_type})"
+                f"No active subscribers found for "
+                f"event {event_id} "
+                f"({event.event_type})"
             )
+
             return
 
         payload_json = json.dumps(
@@ -103,96 +395,28 @@ async def deliver_event(event_id: str):
             sort_keys=True
         )
 
-        async with httpx.AsyncClient() as client:
+        for subscription, subscriber in subscriptions:
 
-            for subscription, subscriber in subscriptions:
-                timestamp = str(
-                    int(datetime.now(timezone.utc).timestamp())
-                )
+            attempt_number = await get_next_attempt_number(
+                db,
+                event.id,
+                subscriber.id
+            )
 
-                signature = generate_signature(
-                    subscriber.secret,
-                    timestamp,
-                    payload_json
-                )
-
-                headers = {
-                    "Content-Type": "application/json",
-                    "X-Webhook-Signature": signature,
-                    "X-Webhook-Timestamp": timestamp
-                }
-
-                attempt_number = 1
-                start_time = time.perf_counter()
-
-                try:
-                    response = await client.post(
-                        subscriber.endpoint_url,
-                        content=payload_json,
-                        headers=headers,
-                        timeout=10.0
-                    )
-
-                    latency_ms = int(
-                        (time.perf_counter() - start_time) * 1000
-                    )
-
-                    delivery_status = (
-                        "success"
-                        if 200 <= response.status_code < 300
-                        else "failed"
-                    )
-
-                    delivery_attempt = DeliveryAttempt(
-                        event_id=event.id,
-                        subscriber_id=subscriber.id,
-                        attempt_number=attempt_number,
-                        status=delivery_status,
-                        http_status_code=response.status_code,
-                        response_body=response.text,
-                        latency_ms=latency_ms,
-                        attempted_at=datetime.now(timezone.utc)
-                    )
-
-                    db.add(delivery_attempt)
-                    db.commit()
-
-                    print(
-                        f"Delivered event {event.id} to "
-                        f"{subscriber.endpoint_url} "
-                        f"status={response.status_code} "
-                        f"latency={latency_ms}ms"
-                    )
-
-                except httpx.RequestError as exc:
-                    latency_ms = int(
-                        (time.perf_counter() - start_time) * 1000
-                    )
-
-                    delivery_attempt = DeliveryAttempt(
-                        event_id=event.id,
-                        subscriber_id=subscriber.id,
-                        attempt_number=attempt_number,
-                        status="failed",
-                        http_status_code=None,
-                        response_body=str(exc),
-                        latency_ms=latency_ms,
-                        attempted_at=datetime.now(timezone.utc)
-                    )
-
-                    db.add(delivery_attempt)
-                    db.commit()
-
-                    print(
-                        f"Delivery failed for event {event.id} "
-                        f"to {subscriber.endpoint_url}: {exc}"
-                    )
+            await deliver_to_subscriber(
+                db,
+                event,
+                subscriber,
+                payload_json,
+                attempt_number
+            )
 
     finally:
         db.close()
 
 
 async def consume_events():
+
     await create_consumer_group()
 
     print(
@@ -201,7 +425,9 @@ async def consume_events():
     )
 
     while True:
+
         try:
+
             messages = await redis_client.xreadgroup(
                 groupname=CONSUMER_GROUP,
                 consumername=CONSUMER_NAME,
@@ -216,15 +442,30 @@ async def consume_events():
                 continue
 
             for stream_name, entries in messages:
+
                 for message_id, data in entries:
+
                     event_id = data.get("event_id")
+                    subscriber_id = data.get(
+                        "subscriber_id"
+                    )
 
                     print(
                         f"Received event: {event_id} "
                         f"(message_id={message_id})"
                     )
 
-                    await deliver_event(event_id)
+                    if subscriber_id:
+
+                        print(
+                            f"Retry delivery for subscriber: "
+                            f"{subscriber_id}"
+                        )
+
+                    await deliver_event(
+                        event_id,
+                        subscriber_id
+                    )
 
                     await redis_client.xack(
                         EVENT_STREAM,
@@ -237,7 +478,7 @@ async def consume_events():
                     )
 
         except TimeoutError:
-            # Expected when the stream is idle.
+
             continue
 
 
