@@ -4856,3 +4856,801 @@ Week 3 — Day 1–2
 The next implementation phase is:
 
 **Week 3 → Day 3: Circuit Breaker**
+
+# Week 3 — Day 3: Circuit Breaker
+
+## Status: COMPLETED ✅
+
+Week 3 Day 3 introduced a **per-subscriber circuit breaker** to prevent the gateway from continuously attempting deliveries to a subscriber that is repeatedly failing.
+
+The circuit breaker monitors recent delivery failures for each subscriber.
+
+When the configured failure threshold is reached, the subscriber is moved from:
+
+```text
+active
+```
+
+to:
+
+```text
+degraded
+```
+
+While degraded, new deliveries and retry deliveries are skipped for that subscriber.
+
+A periodic health-check probe is then used to determine when the subscriber has recovered.
+
+Once the health check succeeds, the subscriber is moved back to:
+
+```text
+active
+```
+
+and normal delivery and retry processing resumes.
+
+---
+
+# Circuit Breaker Architecture
+
+The circuit breaker flow is:
+
+```text
+Webhook Delivery
+      │
+      ▼
+HTTP Response / Network Error
+      │
+      ├── Success ───────────────► Normal Delivery
+      │
+      └── Failure
+            │
+            ▼
+      Record DeliveryAttempt
+            │
+            ▼
+      Check Recent Failures
+            │
+            ▼
+      5 Consecutive Failures
+            │
+            ▼
+      Subscriber → degraded
+            │
+            ▼
+      Stop New Deliveries
+            │
+            ▼
+      Periodic Health Check
+            │
+       ┌────┴─────┐
+       │          │
+    Failure    Success
+       │          │
+       ▼          ▼
+    Remain     active
+    degraded     │
+                  ▼
+          Resume Deliveries
+          + Retry Backlog
+```
+
+The circuit breaker operates **per subscriber**.
+
+Therefore, one failing subscriber does not cause healthy subscribers to stop receiving events.
+
+---
+
+# Circuit Breaker Configuration
+
+The worker contains dedicated configuration values:
+
+```python
+CIRCUIT_FAILURE_THRESHOLD = 5
+CIRCUIT_HEALTH_CHECK_INTERVAL = 60
+```
+
+This means:
+
+```text
+Failure threshold = 5 attempts
+Health check interval = 60 seconds
+```
+
+The subscriber is considered unhealthy when the configured number of recent delivery attempts indicate consecutive failures.
+
+---
+
+# Subscriber States
+
+The existing `Subscriber.status` field is used to represent the circuit breaker state.
+
+The relevant states are:
+
+```text
+active
+degraded
+paused
+```
+
+The circuit breaker specifically transitions between:
+
+```text
+active
+   │
+   │ repeated failures
+   ▼
+degraded
+   │
+   │ successful health check
+   ▼
+active
+```
+
+The `degraded` state is controlled internally by the delivery worker.
+
+The normal subscriber update API continues to expose only:
+
+```text
+active
+paused
+```
+
+so the circuit-breaker state cannot be manually set through the normal subscriber update endpoint.
+
+---
+
+# Failure Detection
+
+A helper function was added to inspect the most recent delivery attempts for a subscriber.
+
+The worker retrieves the latest:
+
+```text
+CIRCUIT_FAILURE_THRESHOLD
+```
+
+delivery attempts for that subscriber.
+
+With the current configuration, this means the worker checks the latest:
+
+```text
+5 attempts
+```
+
+The relevant failure states are:
+
+```text
+pending_retry
+retry_queued
+failed
+```
+
+These represent delivery attempts that did not successfully deliver the webhook.
+
+The worker then checks whether all five recent attempts represent failures.
+
+Conceptually:
+
+```text
+Recent DeliveryAttempts
+
+Attempt 5 → failure
+Attempt 4 → failure
+Attempt 3 → failure
+Attempt 2 → failure
+Attempt 1 → failure
+
+             ↓
+
+     5 consecutive failures
+
+             ↓
+
+Subscriber → degraded
+```
+
+---
+
+# Opening the Circuit
+
+When the failure threshold is reached and the subscriber is currently active, the worker changes:
+
+```text
+subscriber.status
+```
+
+from:
+
+```text
+active
+```
+
+to:
+
+```text
+degraded
+```
+
+The status change is persisted in PostgreSQL.
+
+The worker also logs the circuit-breaker transition:
+
+```text
+Circuit breaker OPENED for subscriber <id>: 5 consecutive failures
+```
+
+The important behavior is that the system does **not** continue hammering the failing subscriber after the circuit opens.
+
+---
+
+# Preventing New Deliveries
+
+The initial event fan-out now considers subscriber status.
+
+Only subscribers with:
+
+```text
+status = active
+```
+
+are selected for normal delivery.
+
+Conceptually:
+
+```text
+Event
+  │
+  ▼
+Matching Subscription
+  │
+  ▼
+Subscriber
+  │
+  ├── active ───────► Deliver
+  │
+  └── degraded ────► Skip
+```
+
+Therefore, once the circuit breaker opens, newly ingested events are not delivered to the degraded subscriber.
+
+---
+
+# Preventing Retry Deliveries
+
+The retry path also checks the subscriber's circuit-breaker state.
+
+If a retry is being processed for a subscriber whose status is:
+
+```text
+degraded
+```
+
+the worker skips the retry delivery.
+
+The worker logs:
+
+```text
+Skipping retry for degraded subscriber: <id>
+```
+
+This prevents the retry system from continuously sending requests to a known unhealthy endpoint.
+
+The pending retry remains available for processing after the subscriber recovers.
+
+---
+
+# Retry Scheduler Integration
+
+The retry scheduler was also updated to respect the circuit breaker.
+
+Due retries are selected only when the subscriber is:
+
+```text
+active
+```
+
+Conceptually:
+
+```text
+pending_retry
+      │
+      ▼
+next_retry_at reached
+      │
+      ▼
+Check Subscriber
+      │
+ ┌────┴─────┐
+ │          │
+active    degraded
+ │          │
+ ▼          ▼
+Queue      Keep
+retry      pending
+```
+
+This is important because otherwise the retry scheduler could continue publishing retries for a subscriber whose circuit is already open.
+
+When the subscriber becomes active again, pending retries become eligible for scheduling.
+
+---
+
+# Health Check Probe
+
+A periodic health-check mechanism was added to the delivery worker.
+
+The worker periodically searches for subscribers with:
+
+```text
+status = degraded
+```
+
+and sends a health-check request to their configured endpoint.
+
+The health-check interval is:
+
+```text
+60 seconds
+```
+
+The health-check uses the subscriber's existing:
+
+```text
+endpoint_url
+secret
+```
+
+and generates a valid HMAC-SHA256 signature using the same signing mechanism used for normal webhook delivery.
+
+The health-check payload is:
+
+```json
+{
+  "type": "webhook_health_check",
+  "message": "Webhook Reliability Gateway health check"
+}
+```
+
+A dedicated header is also included:
+
+```text
+X-Webhook-Health-Check: true
+```
+
+The health check therefore verifies that the subscriber endpoint is reachable and capable of successfully receiving a signed request.
+
+---
+
+# Health Check Success
+
+If the health-check request returns a successful HTTP response:
+
+```text
+2xx
+```
+
+the circuit breaker is closed.
+
+The subscriber status changes:
+
+```text
+degraded
+      │
+      │ successful health check
+      ▼
+active
+```
+
+The change is persisted to PostgreSQL.
+
+The worker logs:
+
+```text
+Circuit breaker CLOSED for subscriber <id>
+```
+
+Once active again:
+
+```text
+Normal deliveries resume
+        +
+Pending retry backlog resumes
+```
+
+---
+
+# Health Check Failure
+
+If the health-check request fails or returns a non-2xx response, the subscriber remains:
+
+```text
+degraded
+```
+
+The worker continues checking the subscriber periodically.
+
+Conceptually:
+
+```text
+degraded
+   │
+   ▼
+Health Check
+   │
+   ├── Failure ──► remain degraded
+   │
+   └── Success ──► active
+```
+
+This prevents the system from reopening the circuit prematurely while the subscriber is still unavailable.
+
+---
+
+# Worker Architecture
+
+The worker now runs both:
+
+```text
+Event Consumption
+```
+
+and:
+
+```text
+Health Check Scheduling
+```
+
+concurrently.
+
+Conceptually:
+
+```text
+                    Delivery Worker
+                         │
+              ┌──────────┴──────────┐
+              │                     │
+              ▼                     ▼
+       Redis Stream             Health Check
+       Consumption              Scheduler
+              │                     │
+              ▼                     ▼
+       Event Delivery        Degraded Subscribers
+              │                     │
+              ▼                     ▼
+       Circuit Breaker        Recovery Probe
+```
+
+This allows the worker to continue processing normal events while periodically checking degraded subscribers.
+
+---
+
+# Circuit Breaker Lifecycle
+
+The complete subscriber lifecycle is now:
+
+```text
+              ┌─────────────┐
+              │   active    │
+              └──────┬──────┘
+                     │
+             5 consecutive
+                failures
+                     │
+                     ▼
+              ┌─────────────┐
+              │  degraded   │
+              └──────┬──────┘
+                     │
+              Health Check
+                     │
+              ┌──────┴──────┐
+              │             │
+           Failure        Success
+              │             │
+              │             ▼
+              │      ┌─────────────┐
+              └─────►│   active    │
+                     └─────────────┘
+```
+
+While the subscriber is degraded:
+
+```text
+❌ New deliveries
+❌ Retry deliveries
+
+✅ Health-check probes
+```
+
+After recovery:
+
+```text
+✅ New deliveries
+✅ Retry backlog
+```
+
+---
+
+# Testing and Verification
+
+The circuit breaker was tested using the existing demo subscriber's outage simulation.
+
+The demo subscriber provides:
+
+```text
+POST /toggle-outage
+```
+
+which switches the subscriber between normal operation and outage mode.
+
+The complete test sequence was:
+
+```text
+Subscriber
+    │
+    ▼
+active
+    │
+    ▼
+Enable outage mode
+    │
+    ▼
+Webhook deliveries return HTTP 500
+    │
+    ▼
+Failure attempts recorded
+    │
+    ▼
+5 consecutive failures
+    │
+    ▼
+Circuit breaker opens
+    │
+    ▼
+Subscriber → degraded
+    │
+    ▼
+New deliveries skipped
+    │
+    ▼
+Disable outage mode
+    │
+    ▼
+Health-check succeeds
+    │
+    ▼
+Circuit breaker closes
+    │
+    ▼
+Subscriber → active
+    │
+    ▼
+Normal delivery resumes
+```
+
+The complete circuit-breaker lifecycle was successfully verified.
+
+---
+
+# Final Verification
+
+The following behavior was manually confirmed:
+
+```text
+Initial subscriber status
+    → active
+
+Outage enabled
+    → HTTP 500 responses
+
+Five consecutive failures
+    → circuit breaker opened
+
+Subscriber status
+    → degraded
+
+Outage disabled
+    → subscriber becomes reachable
+
+Health-check
+    → successful
+
+Circuit breaker
+    → closed
+
+Subscriber status
+    → active
+```
+
+The recovery path also correctly allows normal delivery and retry processing to resume.
+
+---
+
+# Week 3 — Day 3 Completion Checklist
+
+```text
+Week 3 — Day 3
+
+    ✅ Circuit breaker configuration
+    ✅ Per-subscriber failure tracking
+    ✅ Rolling recent-attempt inspection
+    ✅ 5 consecutive failure threshold
+    ✅ Subscriber active → degraded transition
+    ✅ Stop new deliveries to degraded subscribers
+    ✅ Skip retry deliveries to degraded subscribers
+    ✅ Retry scheduler degraded-subscriber filtering
+    ✅ Periodic health-check scheduler
+    ✅ Health-check HMAC signing
+    ✅ Health-check endpoint probing
+    ✅ Successful health-check recovery
+    ✅ Subscriber degraded → active transition
+    ✅ Retry backlog resumes after recovery
+    ✅ Circuit breaker outage simulation
+    ✅ Circuit breaker recovery verified
+```
+
+---
+
+# Important Week 3 Checkpoint
+
+The gateway can now protect failing subscribers from continuous delivery attempts.
+
+The reliability pipeline has evolved from:
+
+```text
+Event
+  │
+  ▼
+Redis Stream
+  │
+  ▼
+Delivery Worker
+  │
+  ▼
+HTTP Delivery
+  │
+  ├──────────────► Success
+  │
+  └── Failure
+       │
+       ▼
+   pending_retry
+       │
+       ▼
+ Retry Scheduler
+       │
+       ▼
+ Redis Stream
+       │
+       ▼
+ Retry Delivery
+```
+
+to:
+
+```text
+Event
+  │
+  ▼
+Redis Stream
+  │
+  ▼
+Delivery Worker
+  │
+  ▼
+HTTP Delivery
+  │
+  ├──────────────► Success
+  │
+  └── Failure
+       │
+       ▼
+   DeliveryAttempt
+       │
+       ▼
+  Check Recent Failures
+       │
+       ▼
+  5 Consecutive Failures
+       │
+       ▼
+Subscriber → degraded
+       │
+       ├──────────────► Skip New Deliveries
+       │
+       ├──────────────► Skip Retries
+       │
+       └──────────────► Health Check
+                              │
+                         ┌────┴─────┐
+                         │          │
+                      Failure     Success
+                         │          │
+                         ▼          ▼
+                     degraded    active
+                                    │
+                                    ▼
+                             Resume Delivery
+                             + Retry Backlog
+```
+
+The circuit breaker therefore adds an important protection mechanism to the retry system:
+
+> **Retries handle temporary delivery failures, while the circuit breaker prevents the gateway from repeatedly hitting a subscriber that is persistently failing.**
+
+---
+
+# Current Position
+
+```text
+Phase 0 — Setup
+    ✅ Docker Compose
+    ✅ PostgreSQL
+    ✅ Redis
+    ✅ FastAPI
+    ✅ Next.js
+    ✅ Alembic
+
+Week 1 — Day 1–2
+    ✅ Schema + Models
+
+Week 1 — Day 3
+    ✅ Event Ingest API
+
+Week 1 — Day 4
+    ✅ Subscriber Management
+
+Week 1 — Day 5
+    ✅ Tests + Documentation
+
+Week 2 — Day 1
+    ✅ Redis Stream Publishing
+
+Week 2 — Day 2–3
+    ✅ Delivery Worker
+    ✅ Redis Consumer Group
+    ✅ Event Loading
+    ✅ Subscription Matching
+    ✅ HMAC Signing
+    ✅ HTTP Delivery
+    ✅ DeliveryAttempt Logging
+
+Week 2 — Day 4
+    ✅ Demo Subscriber
+    ✅ HMAC Verification
+    ✅ Outage Toggle
+
+Week 2 — Day 5
+    ✅ Tests
+    ✅ Final Integration Test
+    ✅ Week 2 Completed
+
+Week 3 — Day 1–2
+    ✅ Retry with Exponential Backoff
+    ✅ Jitter
+    ✅ Retry Scheduling
+    ✅ Per-Subscriber Retries
+    ✅ Maximum Retry Handling
+    ✅ Retry Exhaustion
+
+Week 3 — Day 3
+    ✅ Circuit Breaker
+    ✅ Per-Subscriber Failure Tracking
+    ✅ Failure Threshold
+    ✅ Degraded Subscriber State
+    ✅ Delivery Suppression
+    ✅ Retry Suppression
+    ✅ Health-Check Recovery
+    ✅ Circuit Breaker Verification
+```
+
+## Current Position: Week 3 — Day 3 COMPLETED ✅
+
+The project has now completed the **Circuit Breaker** phase.
+
+The next implementation phase is:
+
+**Week 3 → Day 4: Dead-Letter Queue + Replay**
+
+The next step will add permanent failure handling after the maximum retry attempts have been exhausted.

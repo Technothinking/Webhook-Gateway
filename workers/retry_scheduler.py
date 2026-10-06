@@ -7,6 +7,7 @@ from sqlalchemy import select
 
 from app.db.session import SessionLocal
 from app.models.delivery_attempt import DeliveryAttempt
+from app.models.subscriber import Subscriber
 
 from dotenv import load_dotenv
 
@@ -36,10 +37,15 @@ async def schedule_due_retries():
 
         stmt = (
             select(DeliveryAttempt)
+            .join(
+                Subscriber,
+                DeliveryAttempt.subscriber_id == Subscriber.id
+            )
             .where(
                 DeliveryAttempt.status == "pending_retry",
                 DeliveryAttempt.next_retry_at.is_not(None),
-                DeliveryAttempt.next_retry_at <= now
+                DeliveryAttempt.next_retry_at <= now,
+                Subscriber.status == "active"
             )
             .order_by(
                 DeliveryAttempt.next_retry_at

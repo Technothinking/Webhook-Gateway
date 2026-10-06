@@ -47,6 +47,10 @@ RETRY_DELAYS = [
 JITTER_MAX_SECONDS = 1
 MAX_RETRY_ATTEMPTS = len(RETRY_DELAYS)
 
+# Circuit breaker configuration
+CIRCUIT_FAILURE_THRESHOLD = 5
+
+CIRCUIT_HEALTH_CHECK_INTERVAL = 60
 
 async def create_consumer_group():
     try:
@@ -126,6 +130,178 @@ async def get_next_attempt_number(
         return 1
 
     return last_attempt + 1
+
+
+async def check_circuit_breaker(
+    db,
+    subscriber: Subscriber
+):
+    """
+    Check the subscriber's most recent delivery attempts.
+
+    If the latest CIRCUIT_FAILURE_THRESHOLD attempts
+    are all failures, mark the subscriber as degraded.
+    """
+
+    stmt = (
+        select(DeliveryAttempt.status)
+        .where(
+            DeliveryAttempt.subscriber_id == subscriber.id
+        )
+        .order_by(
+            DeliveryAttempt.attempted_at.desc()
+        )
+        .limit(CIRCUIT_FAILURE_THRESHOLD)
+    )
+
+    result = db.execute(stmt)
+
+    recent_statuses = result.scalars().all()
+
+    if len(recent_statuses) < CIRCUIT_FAILURE_THRESHOLD:
+        return
+
+    failure_statuses = {
+        "pending_retry",
+        "retry_queued",
+        "failed"
+    }
+
+    consecutive_failures = all(
+        status in failure_statuses
+        for status in recent_statuses
+    )
+
+    if consecutive_failures and subscriber.status == "active":
+
+        subscriber.status = "degraded"
+
+        db.commit()
+
+        print(
+            f"Circuit breaker OPENED for subscriber "
+            f"{subscriber.id}: "
+            f"{CIRCUIT_FAILURE_THRESHOLD} consecutive failures"
+        )
+
+
+async def health_check_subscriber(
+    db,
+    subscriber: Subscriber
+):
+    """
+    Send a lightweight health-check request to a degraded subscriber.
+
+    A successful response closes the circuit and restores the
+    subscriber to active status.
+    """
+
+    timestamp = str(
+        int(datetime.now(timezone.utc).timestamp())
+    )
+
+    health_payload = json.dumps(
+        {
+            "type": "webhook_health_check",
+            "message": "Webhook Reliability Gateway health check"
+        },
+        separators=(",", ":"),
+        sort_keys=True
+    )
+
+    signature = generate_signature(
+        subscriber.secret,
+        timestamp,
+        health_payload
+    )
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Webhook-Signature": signature,
+        "X-Webhook-Timestamp": timestamp,
+        "X-Webhook-Health-Check": "true"
+    }
+
+    try:
+        async with httpx.AsyncClient() as client:
+
+            response = await client.post(
+                subscriber.endpoint_url,
+                content=health_payload,
+                headers=headers,
+                timeout=10.0
+            )
+
+        if 200 <= response.status_code < 300:
+
+            subscriber.status = "active"
+
+            db.commit()
+
+            print(
+                f"Circuit breaker CLOSED for subscriber "
+                f"{subscriber.id}: "
+                f"health check succeeded "
+                f"(status={response.status_code})"
+            )
+
+            return True
+
+        print(
+            f"Health check failed for subscriber "
+            f"{subscriber.id}: "
+            f"status={response.status_code}"
+        )
+
+        return False
+
+    except httpx.RequestError as exc:
+
+        print(
+            f"Health check failed for subscriber "
+            f"{subscriber.id}: {exc}"
+        )
+
+        return False
+
+
+async def run_health_checks():
+    """
+    Periodically probe all degraded subscribers.
+    """
+
+    while True:
+
+        db = SessionLocal()
+
+        try:
+
+            subscribers = db.execute(
+                select(Subscriber).where(
+                    Subscriber.status == "degraded"
+                )
+            ).scalars().all()
+
+            for subscriber in subscribers:
+
+                await health_check_subscriber(
+                    db,
+                    subscriber
+                )
+
+        except Exception as exc:
+
+            print(
+                f"Health check scheduler error: {exc}"
+            )
+
+        finally:
+
+            db.close()
+
+        await asyncio.sleep(
+            CIRCUIT_HEALTH_CHECK_INTERVAL
+        )
 
 
 async def deliver_to_subscriber(
@@ -211,6 +387,11 @@ async def deliver_to_subscriber(
             db.add(delivery_attempt)
             db.commit()
 
+            await check_circuit_breaker(
+                db,
+                subscriber
+            )
+
             print(
                 f"Delivery exhausted retries for event {event.id} "
                 f"to {subscriber.endpoint_url} "
@@ -240,6 +421,11 @@ async def deliver_to_subscriber(
             db.add(delivery_attempt)
             db.commit()
 
+            await check_circuit_breaker(
+                db,
+                subscriber
+            )
+
             print(
                 f"Delivery failed for event {event.id} "
                 f"to {subscriber.endpoint_url} "
@@ -266,6 +452,11 @@ async def deliver_to_subscriber(
 
             db.add(delivery_attempt)
             db.commit()
+
+            await check_circuit_breaker(
+                db,
+                subscriber
+            )
 
             print(
                 f"Delivery exhausted retries for event {event.id} "
@@ -295,6 +486,11 @@ async def deliver_to_subscriber(
             db.add(delivery_attempt)
             db.commit()
 
+            await check_circuit_breaker(
+                db,
+                subscriber
+            )
+
             print(
                 f"Delivery failed for event {event.id} "
                 f"to {subscriber.endpoint_url} "
@@ -302,7 +498,6 @@ async def deliver_to_subscriber(
                 f"retry_in={retry_delay}s "
                 f"next_retry_at={next_retry_at}"
             )
-
 
 async def deliver_event(
     event_id: str,
@@ -337,6 +532,13 @@ async def deliver_event(
                 print(
                     f"Subscriber not found: "
                     f"{retry_subscriber_id}"
+                )
+                return
+
+            if subscriber.status == "degraded":
+                print(
+                    f"Skipping retry for degraded subscriber: "
+                    f"{subscriber.id}"
                 )
                 return
 
@@ -483,7 +685,11 @@ async def consume_events():
 
 
 async def main():
-    await consume_events()
+
+    await asyncio.gather(
+        consume_events(),
+        run_health_checks()
+    )
 
 
 if __name__ == "__main__":
