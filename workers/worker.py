@@ -17,6 +17,8 @@ from app.models.delivery_attempt import DeliveryAttempt
 from app.models.event import Event
 from app.models.subscriber import Subscriber
 from app.models.subscription import Subscription
+from app.models.dead_letter import DeadLetter
+
 
 from dotenv import load_dotenv
 
@@ -43,6 +45,7 @@ RETRY_DELAYS = [
     300,    # Attempt 4 -> retry after 5 minutes
     1800    # Attempt 5 -> retry after 30 minutes
 ]
+# RETRY_DELAYS = [1, 2, 3, 4, 5]
 
 JITTER_MAX_SECONDS = 1
 MAX_RETRY_ATTEMPTS = len(RETRY_DELAYS)
@@ -130,6 +133,40 @@ async def get_next_attempt_number(
         return 1
 
     return last_attempt + 1
+
+
+def move_to_dead_letter(
+    db,
+    event_id,
+    subscriber_id,
+    failed_reason,
+):
+    existing_dead_letter = db.scalar(
+        select(DeadLetter).where(
+            DeadLetter.event_id == event_id,
+            DeadLetter.subscriber_id == subscriber_id,
+        )
+    )
+
+    if existing_dead_letter is not None:
+        return existing_dead_letter
+
+    dead_letter = DeadLetter(
+        event_id=event_id,
+        subscriber_id=subscriber_id,
+        failed_reason=failed_reason,
+    )
+
+    db.add(dead_letter)
+    db.commit()
+    db.refresh(dead_letter)
+
+    print(
+        f"Moved event {event_id} for subscriber "
+        f"{subscriber_id} to dead letter queue: {failed_reason}"
+    )
+
+    return dead_letter
 
 
 async def check_circuit_breaker(
@@ -311,6 +348,9 @@ async def deliver_to_subscriber(
     payload_json,
     attempt_number
 ):
+
+    is_replay = attempt_number == 0
+    
     timestamp = str(
         int(datetime.now(timezone.utc).timestamp())
     )
@@ -370,9 +410,9 @@ async def deliver_to_subscriber(
 
             return
 
-        # Non-2xx response
-        if attempt_number >= MAX_RETRY_ATTEMPTS:
-            delivery_attempt = DeliveryAttempt(
+
+        if is_replay:
+            attempt = DeliveryAttempt(
                 event_id=event.id,
                 subscriber_id=subscriber.id,
                 attempt_number=attempt_number,
@@ -380,24 +420,56 @@ async def deliver_to_subscriber(
                 http_status_code=response.status_code,
                 response_body=response.text,
                 latency_ms=latency_ms,
-                attempted_at=datetime.now(timezone.utc),
-                next_retry_at=None
+                next_retry_at=None,
             )
 
-            db.add(delivery_attempt)
+            db.add(attempt)
             db.commit()
+
+            print(
+                f"Replay failed for event {event.id} "
+                f"and subscriber {subscriber.id}"
+            )
+
+            return
+
+        # Non-2xx response
+        if attempt_number >= MAX_RETRY_ATTEMPTS:
+            attempt = DeliveryAttempt(
+                event_id=event.id,
+                subscriber_id=subscriber.id,
+                attempt_number=attempt_number,
+                status="failed",
+                http_status_code=response.status_code,
+                response_body=response.text,
+                latency_ms=latency_ms,
+                next_retry_at=None,
+            )
+
+            db.add(attempt)
+            db.commit()
+
+            move_to_dead_letter(
+                db=db,
+                event_id=event.id,
+                subscriber_id=subscriber.id,
+                failed_reason=(
+                    f"HTTP {response.status_code}: "
+                    f"{response.text[:500]}"
+                ),
+            )
 
             await check_circuit_breaker(
                 db,
-                subscriber
+                subscriber,
             )
 
             print(
-                f"Delivery exhausted retries for event {event.id} "
-                f"to {subscriber.endpoint_url} "
-                f"attempt={attempt_number} "
-                f"status={response.status_code}"
+                f"Retry attempts exhausted for event {event.id} "
+                f"and subscriber {subscriber.id}"
             )
+
+            return
 
         else:
             retry_delay = calculate_retry_delay(attempt_number)
@@ -437,32 +509,58 @@ async def deliver_to_subscriber(
 
     except httpx.RequestError as exc:
 
-        if attempt_number >= MAX_RETRY_ATTEMPTS:
-            delivery_attempt = DeliveryAttempt(
+        if is_replay:
+            attempt = DeliveryAttempt(
                 event_id=event.id,
                 subscriber_id=subscriber.id,
                 attempt_number=attempt_number,
                 status="failed",
-                http_status_code=None,
                 response_body=str(exc),
-                latency_ms=latency_ms,
-                attempted_at=datetime.now(timezone.utc),
-                next_retry_at=None
+                next_retry_at=None,
             )
 
-            db.add(delivery_attempt)
+            db.add(attempt)
             db.commit()
+
+            print(
+                f"Replay failed for event {event.id} "
+                f"and subscriber {subscriber.id}: {exc}"
+            )
+
+            return
+
+
+        if attempt_number >= MAX_RETRY_ATTEMPTS:
+            attempt = DeliveryAttempt(
+                event_id=event.id,
+                subscriber_id=subscriber.id,
+                attempt_number=attempt_number,
+                status="failed",
+                response_body=str(exc),
+                next_retry_at=None,
+            )
+
+            db.add(attempt)
+            db.commit()
+
+            move_to_dead_letter(
+                db=db,
+                event_id=event.id,
+                subscriber_id=subscriber.id,
+                failed_reason=f"Request error: {str(exc)}",
+            )
 
             await check_circuit_breaker(
                 db,
-                subscriber
+                subscriber,
             )
 
             print(
-                f"Delivery exhausted retries for event {event.id} "
-                f"to {subscriber.endpoint_url} "
-                f"attempt={attempt_number}: {exc}"
+                f"Retry attempts exhausted for event {event.id} "
+                f"and subscriber {subscriber.id}: {exc}"
             )
+
+            return
 
         else:
             retry_delay = calculate_retry_delay(attempt_number)
@@ -501,7 +599,8 @@ async def deliver_to_subscriber(
 
 async def deliver_event(
     event_id: str,
-    retry_subscriber_id: str | None = None
+    retry_subscriber_id: str | None = None,
+    replay = False,
 ):
 
     db = SessionLocal()
@@ -548,18 +647,21 @@ async def deliver_event(
                 sort_keys=True
             )
 
-            attempt_number = await get_next_attempt_number(
-                db,
-                event.id,
-                subscriber.id
-            )
+            if replay:
+                attempt_number = 0
+            else:
+                attempt_number = await get_next_attempt_number(
+                    db,
+                    event_id,
+                    retry_subscriber_id,
+                )
 
             await deliver_to_subscriber(
                 db,
                 event,
                 subscriber,
                 payload_json,
-                attempt_number
+                attempt_number,
             )
 
             return
@@ -651,6 +753,7 @@ async def consume_events():
                     subscriber_id = data.get(
                         "subscriber_id"
                     )
+                    replay = data.get("replay") == "true"
 
                     print(
                         f"Received event: {event_id} "
@@ -658,15 +761,23 @@ async def consume_events():
                     )
 
                     if subscriber_id:
-
-                        print(
-                            f"Retry delivery for subscriber: "
-                            f"{subscriber_id}"
-                        )
+                        if replay:
+                            print(
+                                f"Processing replay for event {event_id} "
+                                f"and subscriber {subscriber_id}"
+                            )
+                        else:
+                            print(
+                                f"Processing retry for event {event_id} "
+                                f"and subscriber {subscriber_id}"
+                            )
+                    else:
+                        print(f"Processing new event {event_id}")
 
                     await deliver_event(
                         event_id,
-                        subscriber_id
+                        subscriber_id,
+                        replay=replay,
                     )
 
                     await redis_client.xack(

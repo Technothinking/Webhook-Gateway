@@ -5654,3 +5654,779 @@ The next implementation phase is:
 **Week 3 → Day 4: Dead-Letter Queue + Replay**
 
 The next step will add permanent failure handling after the maximum retry attempts have been exhausted.
+
+# Week 3 — Day 4: Dead-Letter Queue + Replay
+
+## Status: COMPLETED ✅
+
+Week 3 Day 4 introduced permanent failure handling through a **Dead-Letter Queue (DLQ)**.
+
+The gateway can now:
+
+* Move deliveries to the dead-letter state after maximum retry attempts are exhausted
+* Store the reason for the permanent failure
+* List dead-lettered deliveries using `GET /dead-letters`
+* Replay a dead-lettered event to its specific subscriber
+* Bypass the normal retry counter during replay
+* Process replay events through the existing Redis Stream and delivery worker
+
+The complete flow is now:
+
+```text
+Webhook Delivery
+      │
+      ▼
+Retry Attempts
+      │
+      ▼
+Maximum Attempts Exhausted
+      │
+      ▼
+DeadLetter
+      │
+      ├──────────────► GET /dead-letters
+      │
+      ▼
+POST /dead-letters/{id}/replay
+      │
+      ▼
+Redis Stream
+      │
+      ▼
+Delivery Worker
+      │
+      ▼
+Specific Subscriber
+      │
+      ▼
+Replay Delivery
+```
+
+---
+
+# DeadLetter Model
+
+The existing `DeadLetter` database model is now actively used by the delivery worker.
+
+The model contains:
+
+```text
+id
+event_id
+subscriber_id
+failed_reason
+moved_at
+```
+
+Relationships:
+
+```text
+DeadLetter
+ ├── Event
+ └── Subscriber
+```
+
+The `failed_reason` field stores the reason why the delivery permanently failed.
+
+Examples include:
+
+```text
+HTTP 500: {"detail":"Demo subscriber is currently in outage mode"}
+```
+
+or:
+
+```text
+Request error: <connection error>
+```
+
+The `moved_at` field records when the delivery was moved to the dead-letter state.
+
+---
+
+# Moving a Delivery to the Dead-Letter Queue
+
+A helper function was added to the worker:
+
+```python
+move_to_dead_letter(
+    db,
+    event_id,
+    subscriber_id,
+    failed_reason
+)
+```
+
+The helper first checks whether a dead-letter entry already exists for the same:
+
+```text
+event_id
+subscriber_id
+```
+
+If one already exists, it is reused instead of creating another dead-letter record.
+
+Otherwise, a new `DeadLetter` record is created and committed to PostgreSQL.
+
+Conceptually:
+
+```text
+Delivery Failure
+      │
+      ▼
+Maximum Retry Attempts?
+      │
+     Yes
+      │
+      ▼
+Check existing DeadLetter
+      │
+   ┌──┴───┐
+   │      │
+Exists   New
+   │      │
+   │      ▼
+   │   Create
+   │   DeadLetter
+   │      │
+   └──┬───┘
+      ▼
+ PostgreSQL
+```
+
+---
+
+# Dead-Letter Trigger
+
+Dead-letter processing occurs when the maximum number of retry attempts has been exhausted.
+
+For an HTTP failure, the final failed attempt is recorded first.
+
+The delivery attempt stores information such as:
+
+```text
+attempt_number
+status = failed
+http_status_code
+response_body
+latency_ms
+next_retry_at = NULL
+```
+
+After recording the final failed attempt, the worker moves the delivery to the dead-letter queue.
+
+For example:
+
+```text
+Attempt 1
+    ↓
+Retry
+
+Attempt 2
+    ↓
+Retry
+
+Attempt 3
+    ↓
+Retry
+
+Attempt 4
+    ↓
+Retry
+
+Attempt 5
+    ↓
+Maximum Attempts
+    ↓
+DeadLetter
+```
+
+The same permanent-failure handling is also applied when the delivery fails because of a network/request error.
+
+---
+
+# Dead-Letter API Schema
+
+A new response schema was created:
+
+```python
+class DeadLetterResponse(BaseModel):
+    id: UUID
+    event_id: UUID
+    subscriber_id: UUID
+    failed_reason: str
+    moved_at: datetime
+```
+
+The schema uses:
+
+```python
+model_config = {
+    "from_attributes": True
+}
+```
+
+so SQLAlchemy `DeadLetter` objects can be returned directly by FastAPI.
+
+---
+
+# GET /dead-letters
+
+A new endpoint was added:
+
+```text
+GET /dead-letters
+```
+
+The endpoint retrieves dead-letter records from PostgreSQL.
+
+The records are ordered by:
+
+```text
+moved_at DESC
+```
+
+so the most recently dead-lettered deliveries appear first.
+
+The flow is:
+
+```text
+GET /dead-letters
+       │
+       ▼
+PostgreSQL
+       │
+       ▼
+DeadLetter records
+       │
+       ▼
+DeadLetterResponse
+       │
+       ▼
+Client
+```
+
+If no dead-lettered deliveries exist, the endpoint returns:
+
+```json
+[]
+```
+
+---
+
+# Dead-Letter Replay
+
+A replay endpoint was added:
+
+```text
+POST /dead-letters/{dead_letter_id}/replay
+```
+
+The endpoint first loads the requested `DeadLetter` record.
+
+If the record does not exist:
+
+```text
+404 Not Found
+```
+
+is returned.
+
+Otherwise, the gateway republishes the original event to Redis with:
+
+```text
+event_id
+subscriber_id
+replay = true
+```
+
+The important point is that the original event is **not broadcast to all subscribers**.
+
+The replay is explicitly targeted to the subscriber stored in the dead-letter record.
+
+---
+
+# Replay Publishing
+
+The Redis event publisher was extended to support optional subscriber routing and replay messages.
+
+Normal event publishing continues to use:
+
+```python
+publish_event(event_id)
+```
+
+Replay publishing uses:
+
+```python
+publish_event(
+    event_id,
+    subscriber_id=subscriber_id,
+    replay=True
+)
+```
+
+The resulting Redis message contains:
+
+```text
+event_id
+subscriber_id
+replay = true
+```
+
+Therefore the existing Redis Stream infrastructure can be reused without creating a separate replay queue.
+
+---
+
+# Replay Processing in the Worker
+
+The delivery worker was updated to recognize the replay flag.
+
+The consumer now extracts:
+
+```python
+replay = data.get("replay") == "true"
+```
+
+and passes it to:
+
+```python
+deliver_event(
+    event_id,
+    subscriber_id,
+    replay=replay
+)
+```
+
+The worker therefore distinguishes between:
+
+```text
+Normal Event
+     ↓
+Fan out to matching subscribers
+```
+
+and:
+
+```text
+Retry
+     ↓
+Specific subscriber
+```
+
+and:
+
+```text
+Replay
+     ↓
+Specific subscriber
+```
+
+---
+
+# Replay Attempt Number
+
+Replay deliveries use:
+
+```text
+attempt_number = 0
+```
+
+instead of continuing the normal retry attempt sequence.
+
+This allows replay to bypass the normal retry budget.
+
+The existing `DeliveryAttempt` unique constraint is:
+
+```text
+(event_id, subscriber_id, attempt_number)
+```
+
+so using a separate attempt number also prevents the replay from colliding with the existing retry attempts.
+
+The replay flow is therefore:
+
+```text
+Original Delivery
+      │
+      ├── Attempt 1
+      ├── Attempt 2
+      ├── Attempt 3
+      ├── Attempt 4
+      └── Attempt 5
+             │
+             ▼
+         DeadLetter
+             │
+             ▼
+           Replay
+             │
+             ▼
+        Attempt 0
+```
+
+---
+
+# Replay Success Handling
+
+When the replay succeeds, the normal successful delivery handling is used.
+
+The worker records:
+
+```text
+attempt_number = 0
+status = success
+http_status_code = 200
+```
+
+and the Redis message is acknowledged.
+
+Example verified worker output:
+
+```text
+Processing replay for event e4738fde-3d26-421c-ba02-ca502acfeeb4
+and subscriber 43db78c7-f3ff-4072-9187-16f233c432fd
+
+Delivered event e4738fde-3d26-421c-ba02-ca502acfeeb4
+to http://demo-subscriber:8001/webhook
+attempt=0 status=200 latency=35ms
+
+ACKed message
+```
+
+This confirms that the replay was delivered successfully to the intended subscriber.
+
+---
+
+# Replay Failure Handling
+
+Replay is treated as a manual one-shot delivery.
+
+If the replay itself fails, it is recorded as a failed `DeliveryAttempt` using:
+
+```text
+attempt_number = 0
+status = failed
+```
+
+The replay does not automatically consume the normal retry budget again.
+
+The original dead-letter record remains available for historical tracking.
+
+---
+
+# Dead-Letter Verification
+
+The dead-letter flow was tested using the demo subscriber's outage mode.
+
+The subscriber was intentionally placed into outage mode, causing HTTP `500` responses.
+
+The delivery progressed through the shortened development retry schedule:
+
+```text
+Attempt 1
+    ↓
+Attempt 2
+    ↓
+Attempt 3
+    ↓
+Attempt 4
+    ↓
+Attempt 5
+    ↓
+Retries Exhausted
+    ↓
+DeadLetter created
+```
+
+The worker successfully logged:
+
+```text
+Moved event ... to dead letter queue:
+HTTP 500: {"detail":"Demo subscriber is currently in outage mode"}
+```
+
+The resulting record was then successfully retrieved using:
+
+```text
+GET /dead-letters
+```
+
+---
+
+# Dead-Letter Replay Verification
+
+After the dead-letter record was created, the demo subscriber's outage mode was disabled.
+
+The dead-letter replay endpoint was then called.
+
+The worker successfully processed the replay:
+
+```text
+Received event: ...
+Processing replay for event ... and subscriber ...
+
+Delivered event ...
+attempt=0 status=200
+```
+
+The Redis message was subsequently acknowledged:
+
+```text
+ACKed message
+```
+
+This verified the complete dead-letter lifecycle:
+
+```text
+Delivery Failure
+      │
+      ▼
+Retry Attempts
+      │
+      ▼
+Retries Exhausted
+      │
+      ▼
+DeadLetter Created
+      │
+      ▼
+GET /dead-letters
+      │
+      ▼
+Replay Requested
+      │
+      ▼
+Redis Stream
+      │
+      ▼
+Target Subscriber
+      │
+      ▼
+HTTP 200
+      │
+      ▼
+ACK
+```
+
+---
+
+# Circuit Breaker Compatibility Fix
+
+During Day 4 testing, the dead-letter creation itself succeeded, but the worker encountered an exception immediately afterward:
+
+```text
+AttributeError: 'UUID' object has no attribute 'id'
+```
+
+The issue occurred because `check_circuit_breaker()` expects the subscriber object, while the delivery code was passing `subscriber.id`.
+
+The calls were corrected to pass:
+
+```python
+subscriber
+```
+
+instead of:
+
+```python
+subscriber.id
+```
+
+The circuit breaker can therefore continue accessing:
+
+```python
+subscriber.id
+```
+
+internally without receiving a UUID object.
+
+After this correction, dead-letter creation and subsequent circuit-breaker processing completed without crashing the worker.
+
+---
+
+# Week 3 — Day 4 Completion Checklist
+
+```text
+Week 3 — Day 4
+
+    ✅ DeadLetter persistence
+    ✅ Dead-letter failure reason
+    ✅ Dead-letter timestamp
+    ✅ Maximum retry exhaustion → DeadLetter
+    ✅ HTTP failure → DeadLetter
+    ✅ Network error → DeadLetter
+    ✅ Duplicate DeadLetter prevention
+    ✅ DeadLetter response schema
+    ✅ GET /dead-letters
+    ✅ Dead-letter ordering by moved_at
+    ✅ POST /dead-letters/{id}/replay
+    ✅ Replay event publishing
+    ✅ Subscriber-specific replay routing
+    ✅ Replay flag in Redis message
+    ✅ Replay handling in delivery worker
+    ✅ Replay bypasses normal retry counter
+    ✅ Replay attempt_number = 0
+    ✅ Successful replay delivery
+    ✅ Replay Redis ACK
+    ✅ Circuit breaker compatibility fix
+    ✅ End-to-end dead-letter verification
+    ✅ End-to-end replay verification
+```
+
+---
+
+# Important Week 3 Checkpoint
+
+The gateway now has a complete failure-handling chain:
+
+```text
+Event
+  │
+  ▼
+Redis Stream
+  │
+  ▼
+Delivery Worker
+  │
+  ▼
+HTTP Delivery
+  │
+  ├──────────────► Success
+  │
+  └── Failure
+       │
+       ▼
+   pending_retry
+       │
+       ▼
+ Retry Scheduler
+       │
+       ▼
+   Retry Delivery
+       │
+       ├──────────────► Success
+       │
+       └── Maximum Attempts
+                    │
+                    ▼
+                DeadLetter
+                    │
+                    ▼
+              Replay Request
+                    │
+                    ▼
+               Redis Stream
+                    │
+                    ▼
+             Target Subscriber
+                    │
+                    ▼
+              Replay Delivery
+```
+
+The system can now distinguish between:
+
+```text
+Temporary Failure
+       ↓
+Retry
+```
+
+and:
+
+```text
+Persistent Failure
+       ↓
+DeadLetter
+```
+
+while also providing a mechanism to manually replay a permanently failed delivery.
+
+---
+
+# Current Completion Status
+
+```text
+Phase 0 — Setup
+    ✅ Docker Compose
+    ✅ PostgreSQL
+    ✅ Redis
+    ✅ FastAPI
+    ✅ Next.js
+    ✅ Alembic
+
+Week 1 — Day 1–2
+    ✅ Schema + Models
+
+Week 1 — Day 3
+    ✅ Event Ingest API
+    ✅ Idempotency
+    ✅ Event Query APIs
+
+Week 1 — Day 4
+    ✅ Subscriber Management
+    ✅ Subscription Management
+
+Week 1 — Day 5
+    ✅ Tests
+    ✅ Documentation
+
+Week 2 — Day 1
+    ✅ Redis Stream Publishing
+
+Week 2 — Day 2–3
+    ✅ Delivery Worker
+    ✅ Redis Consumer Group
+    ✅ Event Loading
+    ✅ Subscription Matching
+    ✅ HMAC Signing
+    ✅ HTTP Delivery
+    ✅ DeliveryAttempt Logging
+
+Week 2 — Day 4
+    ✅ Demo Subscriber
+    ✅ HMAC Verification
+    ✅ Outage Toggle
+
+Week 2 — Day 5
+    ✅ Tests
+    ✅ Final Integration Test
+    ✅ Week 2 Completed
+
+Week 3 — Day 1–2
+    ✅ Retry with Exponential Backoff
+    ✅ Jitter
+    ✅ Retry Scheduling
+    ✅ Per-Subscriber Retries
+    ✅ Maximum Retry Handling
+    ✅ Retry Exhaustion
+
+Week 3 — Day 3
+    ✅ Circuit Breaker
+    ✅ Per-Subscriber Failure Tracking
+    ✅ Failure Threshold
+    ✅ Degraded Subscriber State
+    ✅ Delivery Suppression
+    ✅ Retry Suppression
+    ✅ Health-Check Recovery
+    ✅ Circuit Breaker Verification
+
+Week 3 — Day 4
+    ✅ Dead-Letter Queue
+    ✅ Dead-Letter Persistence
+    ✅ Dead-Letter API
+    ✅ Dead-Letter Replay
+    ✅ Subscriber-Specific Replay
+    ✅ Replay Verification
+```
+
+## Current Position: Week 3 — Day 4 COMPLETED ✅
+
+The project has now completed the **Dead-Letter Queue + Replay** phase.
+
+The next planned step is:
+
+**Week 3 → Day 5: Tests + Kill/Recover Demo**
+
+The final Week 3 testing phase will verify the complete reliability pipeline, including retries, circuit breaking, subscriber recovery, dead-letter replay, and correct delivery behavior across healthy and failing subscribers.

@@ -1,15 +1,22 @@
 from app.redis.client import redis_client
 
 
-EVENT_STREAM = "webhook_events"
+async def publish_event(
+    event_id,
+    subscriber_id=None,
+    replay=False,
+):
+    message = {
+        "event_id": str(event_id),
+    }
 
+    if subscriber_id is not None:
+        message["subscriber_id"] = str(subscriber_id)
 
-async def publish_event(event_id: str) -> str:
-    message_id = await redis_client.xadd(
-        EVENT_STREAM,
-        {
-            "event_id": event_id
-        }
+    if replay:
+        message["replay"] = "true"
+
+    await redis_client.xadd(
+        "webhook_events",
+        message,
     )
-
-    return message_id
