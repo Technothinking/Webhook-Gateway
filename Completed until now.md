@@ -6430,3 +6430,331 @@ The next planned step is:
 **Week 3 → Day 5: Tests + Kill/Recover Demo**
 
 The final Week 3 testing phase will verify the complete reliability pipeline, including retries, circuit breaking, subscriber recovery, dead-letter replay, and correct delivery behavior across healthy and failing subscribers.
+
+# Week 3 — Day 5: Tests + Reliability Fixes + Kill/Recover Demo
+
+## Status: COMPLETED ✅
+
+Week 3 Day 5 added automated tests for the circuit breaker, fixed a set of reliability gaps found while reviewing the delivery pipeline, and delivered the headline "kill and recover" demo.
+
+The demo ran end to end and passed:
+
+```text
+RESULT: PASS - zero loss, zero duplicates
+```
+
+100 events were fired while one subscriber was down. Every event reached both subscribers exactly once, and the healthy subscriber never saw a retry or a duplicate.
+
+No database schema change was made. All new behavior is encoded in existing columns (`status`, `attempt_number`, `next_retry_at`).
+
+---
+
+# Circuit Breaker Tests
+
+A new test file was added:
+
+```text
+api/tests/test_circuit_breaker.py
+```
+
+It runs the real `check_circuit_breaker` and `health_check_subscriber` functions against PostgreSQL. Only the outgoing HTTP call of the health check is faked.
+
+Covered cases:
+
+```text
+5 consecutive failures            → circuit opens (degraded)
+pending_retry / retry_queued      → count as failures
+4 failures                        → circuit stays closed
+a success in the window           → circuit stays closed
+paused subscriber                 → never flipped to degraded
+one subscriber's failures         → do not affect another subscriber
+health check 200                  → circuit closes (active), probe is signed + flagged
+health check 500                  → stays degraded
+unreachable endpoint              → stays degraded
+full cycle                        → 5 failures → degraded → success → active
+```
+
+All 10 tests passed.
+
+The worker is not importable from the `api` container (only the `worker` and `retry-scheduler` services mount `./workers`), so tests that import the worker are run in the worker container:
+
+```bash
+docker compose exec worker pytest /app/tests/test_circuit_breaker.py -v
+```
+
+---
+
+# Reliability Gaps Found and Fixed
+
+Reviewing the code against the demo scenario exposed these problems. All were fixed in `workers/worker.py` and `workers/retry_scheduler.py`.
+
+| # | Problem | Fix |
+|---|---|---|
+| 1 | A network error on a non-final attempt crashed the retry path (`latency_ms` was undefined) | `latency_ms` is initialised to `None` |
+| 2 | A retry already flipped to `retry_queued` was skipped when the circuit was open and then orphaned forever | The worker puts it back to `pending_retry` (or `deferred`) so the scheduler picks it up after recovery |
+| 3 | Events arriving while a subscriber was degraded were silently dropped (no attempt row, never retried, never dead-lettered) | They are now **deferred** (see below) |
+| 4 | Replay was skipped for degraded subscribers | Replay is an explicit operator action and now bypasses the circuit breaker |
+| 5 | Replaying the same dead letter twice violated the unique constraint and crashed the worker | Each replay gets a new attempt number |
+| 6 | Any unexpected exception killed the consumer loop | Per-message error handling plus stale-message reclaim |
+| 7 | `Event.status` never left `pending`; the consumer group started at `$` | Event status is now derived; the group starts at `0` |
+
+---
+
+# Deferred Deliveries
+
+When an event matches a subscriber whose circuit is open, the worker no longer skips it. It records a placeholder attempt:
+
+```text
+attempt_number = -1
+status         = deferred
+next_retry_at  = now
+```
+
+The retry scheduler now picks up `deferred` rows as well as `pending_retry` rows, but only for subscribers whose status is `active`.
+
+```text
+Event arrives
+     │
+     ▼
+Subscriber degraded?
+     │
+ ┌───┴────┐
+ No      Yes
+ │        │
+ ▼        ▼
+Deliver   Record deferred attempt
+          │
+          ▼
+   Circuit closes (health check OK)
+          │
+          ▼
+   Scheduler queues the deferred row
+          │
+          ▼
+   Worker delivers it (attempt 1)
+```
+
+The deferred placeholder does **not** consume the retry budget. The first real delivery after recovery is attempt 1.
+
+Paused subscribers still receive nothing. Their events are not deferred, because pausing is an explicit stop.
+
+---
+
+# attempt_number Conventions
+
+The unique constraint is `(event_id, subscriber_id, attempt_number)`, so the numbering carries meaning:
+
+```text
+1, 2, 3 ...      real delivery attempts (retry budget)
+0                first manual replay
+-2, -3, ...      later replays
+-1               deferred placeholder
+```
+
+The circuit breaker only inspects real attempts (`attempt_number > 0`), so replays and deferred placeholders can neither open nor mask an open circuit.
+
+---
+
+# Duplicate-Delivery Guards
+
+Because stale stream messages can now be reclaimed and re-processed, two idempotency guards were added:
+
+```text
+Initial fan-out → skip a subscriber that already has any attempt for the event
+Retry           → skip if the subscriber already has a success for the event
+```
+
+Together with Redis consumer groups, these keep at-least-once delivery from turning into duplicate deliveries after a crash or reclaim.
+
+---
+
+# Stream Reliability
+
+```text
+Consumer group start   "$" → "0"   events published before the first worker started are processed
+Per-message errors     caught; the message stays pending instead of crashing the worker
+Reclaim loop           XAUTOCLAIM for messages idle longer than 120s
+Poison messages        dropped with a log line after more than 5 deliveries
+Consumer loop errors   logged, 2s pause, loop continues
+```
+
+The worker now runs three concurrent tasks:
+
+```text
+consume_events()          stream consumption
+run_health_checks()       circuit breaker recovery probes
+reclaim_stale_messages()  crash recovery
+```
+
+---
+
+# Derived Event Status
+
+`Event.status` is now updated after every delivery step:
+
+```text
+pending         accepted, not processed yet
+no_subscribers  no active subscription matched
+retrying        at least one subscriber has not received it yet
+dead_lettered   an undelivered subscriber was dead-lettered
+delivered       every targeted subscriber has a success
+```
+
+---
+
+# Configuration Overrides
+
+Two worker settings can now be overridden through environment variables, with production defaults unchanged. This makes demos fast without editing code:
+
+```text
+RETRY_DELAYS                    default 1,5,30,300,1800
+CIRCUIT_HEALTH_CHECK_INTERVAL   default 60
+```
+
+`docker-compose.yml` passes them to the `worker` service with `${VAR:-default}`.
+
+---
+
+# Second Demo Subscriber
+
+A second receiver was added to Docker Compose as the "healthy" subscriber:
+
+```text
+demo-subscriber     port 8001   killed during the demo
+demo-subscriber-2   port 8002   stays healthy (secret: WEBHOOK_SECRET_2, default day5-healthy-secret)
+```
+
+Both use the same `demo-subscriber` image.
+
+---
+
+# Kill and Recover Demo
+
+Script:
+
+```text
+api/scripts/kill_and_recover_demo.py
+```
+
+Run inside the worker container:
+
+```bash
+docker compose exec -e WEBHOOK_SECRET=<value from .env> worker python /app/scripts/kill_and_recover_demo.py
+```
+
+For a faster run, set the overrides first and recreate the worker:
+
+```text
+set RETRY_DELAYS=1,2,3,4,5
+set CIRCUIT_HEALTH_CHECK_INTERVAL=10
+docker compose up -d worker
+```
+
+Scenario:
+
+```text
+Register flaky + healthy subscribers for a fresh event type
+        │
+        ▼
+Kill flaky subscriber (outage mode)
+        │
+        ▼
+Fire 100 events
+        │
+        ▼
+Retries queue, circuit breaker trips (flaky → degraded),
+later events are deferred, healthy subscriber keeps receiving
+        │
+        ▼
+Restore flaky subscriber
+        │
+        ▼
+Health check closes the circuit (degraded → active)
+        │
+        ▼
+Deferred + pending backlog drains through the scheduler
+        │
+        ▼
+Replay any dead letters
+        │
+        ▼
+Verify: exactly one success per (event, subscriber),
+        no failures or retries on the healthy subscriber
+```
+
+Observed result of the verified run:
+
+```text
+circuit OPEN. flaky attempts so far: {'deferred': 11, 'pending_retry': 5}
+flaky:   delivered=100/100 missing=0 duplicate_successes=0
+healthy: delivered=100/100 missing=0 duplicate_successes=0 attempts={'success': 100}
+RESULT: PASS - zero loss, zero duplicates
+```
+
+Note: an earlier run failed because the `retry-scheduler` container was still running the old code and ignored `deferred` rows. Restarting it with `docker compose restart worker retry-scheduler` fixed that. After changing worker or scheduler code, restart those containers: a volume mount does not reload a running Python process.
+
+---
+
+# Documentation Added
+
+```text
+api/docs/delivery-states.md
+```
+
+It documents attempt statuses, the `attempt_number` conventions, derived event statuses, how each subscriber state treats new events, retries and replays, and the safety nets above.
+
+---
+
+# Known Behavior to Remember
+
+* Each retry creates a new attempt row, so superseded rows keep the label `retry_queued` after the retry succeeds (the demo shows `retry_queued: 100` next to `success: 100`). This does not affect delivery or the circuit breaker, but dashboard success-rate queries should account for it.
+* After recovery, the scheduler publishes at most 100 queued rows per poll (once per second).
+* After the circuit closes, the last 5 real attempts may still all be failures, so a flapping endpoint can reopen the circuit on its first failure.
+
+---
+
+# Week 3 — Day 5 Completion Checklist
+
+```text
+Week 3 — Day 5
+
+    ✅ Circuit breaker tests (10 passing)
+    ✅ Worker reliability tests (deferral, requeue, replay, idempotency, network error)
+    ✅ Network-error retry crash fixed
+    ✅ Retry requeue when subscriber is degraded or paused
+    ✅ Deferred deliveries for degraded subscribers
+    ✅ Retry scheduler picks up deferred rows
+    ✅ Replay bypasses circuit breaker
+    ✅ Repeated replays supported
+    ✅ Per-message error handling in consumer loop
+    ✅ XAUTOCLAIM reclaim loop + poison message cap
+    ✅ Duplicate-delivery guards
+    ✅ Derived Event.status
+    ✅ Consumer group created at "0"
+    ✅ RETRY_DELAYS / CIRCUIT_HEALTH_CHECK_INTERVAL env overrides
+    ✅ Second demo subscriber (demo-subscriber-2)
+    ✅ Kill and recover demo script
+    ✅ Demo verified: 100 events, zero loss, zero duplicates
+    ✅ docs/delivery-states.md
+```
+
+---
+
+# Week 3 Completion Status
+
+```text
+Week 3 — Day 1–2   ✅ Retry with Exponential Backoff + Jitter
+Week 3 — Day 3     ✅ Circuit Breaker
+Week 3 — Day 4     ✅ Dead-Letter Queue + Replay
+Week 3 — Day 5     ✅ Tests + Reliability Fixes + Kill/Recover Demo
+```
+
+## Current Position: Week 3 COMPLETED ✅
+
+The core reliability story is fully real and demoable through the API, scripts and logs, before any UI exists.
+
+The next implementation phase is:
+
+**Week 4 → Dashboard**
+
+It needs a few read endpoints first: `GET /delivery-attempts?since=...` for the live feed, a stats endpoint for totals, success rate and p50/p99 latency, and per-subscriber success rates for the subscriber list.

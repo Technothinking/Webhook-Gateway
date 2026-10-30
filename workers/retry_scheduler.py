@@ -20,6 +20,10 @@ EVENT_STREAM = "webhook_events"
 
 POLL_INTERVAL_SECONDS = 1
 
+# 'pending_retry' : a failed attempt waiting for its backoff to elapse
+# 'deferred'      : an event parked while the subscriber was degraded
+SCHEDULABLE_STATUSES = ("pending_retry", "deferred")
+
 
 redis_client = redis.from_url(
     REDIS_URL,
@@ -42,7 +46,7 @@ async def schedule_due_retries():
                 DeliveryAttempt.subscriber_id == Subscriber.id
             )
             .where(
-                DeliveryAttempt.status == "pending_retry",
+                DeliveryAttempt.status.in_(SCHEDULABLE_STATUSES),
                 DeliveryAttempt.next_retry_at.is_not(None),
                 DeliveryAttempt.next_retry_at <= now,
                 Subscriber.status == "active"
@@ -67,15 +71,23 @@ async def schedule_due_retries():
                 }
             )
 
+            was_deferred = attempt.status == "deferred"
+
             attempt.status = "retry_queued"
 
             db.commit()
 
+            next_attempt = (
+                attempt.attempt_number + 1
+                if attempt.attempt_number > 0
+                else 1
+            )
+
             print(
-                f"Scheduled retry: "
+                f"Scheduled {'deferred delivery' if was_deferred else 'retry'}: "
                 f"event={attempt.event_id} "
                 f"subscriber={attempt.subscriber_id} "
-                f"attempt={attempt.attempt_number + 1}"
+                f"attempt={next_attempt}"
             )
 
     finally:

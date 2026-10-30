@@ -41,6 +41,11 @@ services:
       REDIS_URL: ${REDIS_URL}
       WORKER_NAME: worker-1
       PYTHONPATH: /app
+      # Defaults match production behaviour; override for quick demos, e.g.
+      #   set RETRY_DELAYS=1,2,3,4,5
+      #   set CIRCUIT_HEALTH_CHECK_INTERVAL=10
+      RETRY_DELAYS: ${RETRY_DELAYS:-1,5,30,300,1800}
+      CIRCUIT_HEALTH_CHECK_INTERVAL: ${CIRCUIT_HEALTH_CHECK_INTERVAL:-60}
     volumes:
       - ./api:/app
       - ./workers:/worker
@@ -73,6 +78,19 @@ services:
       WEBHOOK_SECRET: ${WEBHOOK_SECRET}
     ports:
       - "8001:8001"
+    volumes:
+      - ./demo-subscriber:/app
+
+  # Second receiver with its own secret: the "healthy" subscriber in the
+  # kill-and-recover demo (the first one is the one that gets killed).
+  demo-subscriber-2:
+    build:
+      context: ./demo-subscriber
+    container_name: webhook-demo-subscriber-2
+    environment:
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET_2:-day5-healthy-secret}
+    ports:
+      - "8002:8001"
     volumes:
       - ./demo-subscriber:/app
 
