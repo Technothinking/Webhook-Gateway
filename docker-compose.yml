@@ -106,6 +106,8 @@ services:
       - /app/.next
     depends_on:
       - api
-
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      DEMO_SUBSCRIBER_URL: http://demo-subscriber:8001
 volumes:
   postgres_data:

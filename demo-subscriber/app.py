@@ -124,6 +124,11 @@ async def receive_healthy_webhook(
     }
 
 
+@app.get("/outage")
+def get_outage():
+    return {"outage_mode": OUTAGE_MODE}
+
+
 @app.post("/toggle-outage")
 def toggle_outage():
     global OUTAGE_MODE
