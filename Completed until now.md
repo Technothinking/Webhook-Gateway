@@ -6758,3 +6758,347 @@ The next implementation phase is:
 **Week 4 → Dashboard**
 
 It needs a few read endpoints first: `GET /delivery-attempts?since=...` for the live feed, a stats endpoint for totals, success rate and p50/p99 latency, and per-subscriber success rates for the subscriber list.
+
+# Week 4 — Dashboard (Day 0–3)
+
+## Status: Day 0–3 COMPLETED ✅
+
+Week 4 turns the API into something a non-technical viewer can watch in real time. Day 0–3 delivered the backend read endpoints, a Next.js dashboard with a live subscriber list and delivery feed, and browser controls to send events and kill/restore the demo subscriber.
+
+The full "kill and recover" demo can now be run from the browser with zero terminal commands.
+
+No database schema change was made. No worker or scheduler code was touched.
+
+---
+
+# Day 0 — Backend read endpoints + CORS
+
+The dashboard runs at `http://localhost:3000` and calls the API at `http://localhost:8000` from the browser, so CORS had to be enabled first. Three read endpoints were added for the dashboard.
+
+## Files
+
+```text
+api/app/main.py                          (modified: CORS + 2 new routers)
+api/app/schemas/delivery_attempt.py      (new)
+api/app/routes/delivery_attempts.py      (new)
+api/app/routes/stats.py                  (new)
+```
+
+## CORS
+
+`CORSMiddleware` allows origin `http://localhost:3000`, all methods, all headers. When deploying in Week 5 this origin list must include the deployed dashboard URL.
+
+## GET /delivery-attempts
+
+Live feed. Joins `DeliveryAttempt` with `Subscriber.name` and `Event.event_type`.
+
+```text
+Query params
+    since   optional ISO datetime, filters attempted_at > since
+    limit   default 50, min 1, max 200
+Ordering
+    attempted_at DESC
+Response item (DeliveryAttemptFeedItem)
+    id, event_id, event_type, subscriber_id, subscriber_name,
+    attempt_number, status, http_status_code, latency_ms,
+    attempted_at, next_retry_at
+```
+
+Design note: attempt rows mutate after being written (`pending_retry` → `retry_queued`), so appending with `since` would show stale statuses. The dashboard therefore refetches the latest 50 every 2s and replaces its list. `since` exists but is unused by the frontend.
+
+## GET /stats
+
+Overall numbers for the (upcoming) stats strip.
+
+```text
+total_events
+total_attempts
+success_rate        successes / real attempts (null if no attempts)
+p50_latency_ms      percentile_cont(0.5)  over real attempts with latency
+p99_latency_ms      percentile_cont(0.99) over real attempts with latency
+dead_letters        count of DeadLetter rows
+```
+
+## GET /stats/subscribers
+
+Per-subscriber list with a recent success rate.
+
+```text
+Query param
+    window_minutes  default 60, min 1, max 1440
+Response item
+    id, name, endpoint_url, status, attempts, success_rate
+```
+
+`success_rate` is null when the subscriber had no real attempts inside the window. Subscribers are ordered newest first. This is a separate endpoint so `SubscriberResponse` and its tests stay untouched.
+
+## Success-rate definition
+
+Both stats endpoints count only **real attempts** (`attempt_number > 0`):
+
+```text
+Included    1..N real HTTP attempts (success, pending_retry,
+            retry_queued, failed)
+Excluded    deferred placeholder (-1) and replays (0, -2, -3, ...)
+```
+
+Superseded `retry_queued` rows still count as the failures they were, which resolves the "known behavior" noted in Week 3 Day 5. Consequence: a successful replay does not raise the success rate.
+
+## Route style
+
+New routers use `""` (no trailing slash), like `dead_letters.py`, so there are no 307 redirects under CORS. Note `events.py` and `subscribers.py` still use `"/"`.
+
+## Verification
+
+```bash
+curl localhost:8000/stats
+curl localhost:8000/stats/subscribers
+curl "localhost:8000/delivery-attempts?limit=5"
+```
+
+All three returned correct data.
+
+---
+
+# Day 1 — Dashboard scaffold + subscriber list
+
+## Files
+
+```text
+dashboard/src/lib/api.ts                      (new)
+dashboard/src/components/SubscriberList.tsx   (new)
+dashboard/src/app/page.tsx                    (replaced default Next.js page)
+dashboard/src/app/layout.tsx                  (title changed to "Webhook Gateway")
+docker-compose.yml                            (dashboard env var)
+```
+
+## Configuration
+
+`docker-compose.yml`, `dashboard` service:
+
+```yaml
+environment:
+  NEXT_PUBLIC_API_URL: http://localhost:8000
+```
+
+This is the URL the **browser** uses, so it is the host-side address, not the Docker service name.
+
+## lib/api.ts
+
+- Exports `API_URL` (from `NEXT_PUBLIC_API_URL`, default `http://localhost:8000`).
+- `SubscriberStat` type and `getSubscriberStats()` using `fetch(..., { cache: "no-store" })`.
+
+## SubscriberList
+
+Client component (`"use client"`) that polls `/stats/subscribers` every 3s.
+
+```text
+Status badge     🟢 active   🟡 degraded   🔴 paused   ⚪ anything else
+Right side       "<rate>% success (<attempts>)" or "no recent traffic"
+States handled   loading, error (API unreachable), empty
+```
+
+An `alive` flag prevents state updates after unmount.
+
+## Verification
+
+Subscribers render with badges. Toggling outage and firing events flips a badge 🟢 → 🟡 and back.
+
+---
+
+# Day 2 — Live delivery feed
+
+## Files
+
+```text
+dashboard/src/lib/api.ts                  (added FeedItem type + getFeed)
+dashboard/src/components/LiveFeed.tsx     (new)
+dashboard/src/app/page.tsx                (added "Live deliveries" section)
+```
+
+## LiveFeed
+
+Polls `GET /delivery-attempts?limit=50` every 2s and replaces its list. Scrollable table (`max-h-96`) with a sticky header.
+
+```text
+Columns   Time, Event, Subscriber, Attempt, Status (+ HTTP code), Latency
+Attempt   #N for real attempts, "deferred" for -1, "replay" for <= 0 otherwise
+Colors    success green; pending_retry/retry_queued amber;
+          deferred blue; failed red
+```
+
+## "How this works" explanations
+
+Each row has a `title` tooltip:
+
+```text
+pending_retry   "Backing off: next attempt in ~Ns"   (from next_retry_at)
+retry_queued    "Retry queued: a worker will pick it up shortly"
+deferred        "Subscriber's circuit is open: held until it recovers"
+failed (N > 0)  "Retries exhausted: moved to the dead-letter queue"
+```
+
+These are plain `title` attributes for now. Day 5 can replace them with real tooltips.
+
+## Verification
+
+With outage on and 5 events fired: rows go amber, the badge turns 🟡, later events show `deferred` (blue). After restore, rows go green and the badge returns to 🟢.
+
+---
+
+# Day 3 — Event form + outage toggle
+
+## Files
+
+```text
+demo-subscriber/app.py                              (modified: GET /outage)
+dashboard/src/app/api/outage/route.ts               (new: proxy route)
+dashboard/src/components/OutageToggle.tsx           (new)
+dashboard/src/components/EventForm.tsx              (new)
+dashboard/src/app/page.tsx                          (added "Controls" section)
+docker-compose.yml                                  (dashboard env var)
+```
+
+## Demo subscriber: GET /outage
+
+`POST /toggle-outage` only flips a flag and cannot report state. A read endpoint was added:
+
+```python
+@app.get("/outage")
+def get_outage():
+    return {"outage_mode": OUTAGE_MODE}
+```
+
+The demo subscriber runs without `--reload`, so it needs `docker compose restart demo-subscriber` after changes.
+
+## Proxy route: /api/outage
+
+Next.js route handler (`force-dynamic`). `GET` proxies to `demo-subscriber:/outage` and `POST` proxies to `/toggle-outage`. Returns 502 with an error body if the demo subscriber is unreachable.
+
+Why a proxy instead of calling the demo subscriber from the browser:
+
+```text
+Browser ──► dashboard /api/outage ──► demo-subscriber (Docker network)
+```
+
+It avoids CORS on the demo subscriber, and the same pattern works for the deployed dashboard without exposing the demo port.
+
+`docker-compose.yml`, `dashboard` service, server-side only (deliberately not `NEXT_PUBLIC_`):
+
+```yaml
+DEMO_SUBSCRIBER_URL: http://demo-subscriber:8001
+```
+
+## OutageToggle
+
+Polls `/api/outage` every 3s to show the real state, and a **Kill** / **Restore** button posts the toggle. The label shows "✅ Healthy", "💥 Outage ON: returning HTTP 500", "Checking…", or "Unreachable (...)". The button is disabled while busy or before the first state read.
+
+## EventForm
+
+Fields: event type (max 30 chars, matching the DB column), count (1–100), payload (JSON object).
+
+```text
+Validation   payload must parse as JSON and be an object (not array/null)
+Sending      sequential POST /events/ per event
+Payload      user JSON plus an "n" index per event
+Idempotency  fresh "dash-<uuid>" key per event, so bursts are distinct events
+Result       "Sent X/N events" plus the last error if any
+```
+
+Events go straight from the browser to the API (`API_URL`), which relies on the Day 0 CORS config.
+
+## Verification
+
+Full demo from the browser only: Kill → send 5 events → badge 🟡 with failures then `deferred` rows → Restore → badge returns to 🟢 after the health check, feed goes green.
+
+---
+
+# Things learned during Day 0–3
+
+* **Why 2 events did not trip the circuit breaker:** the breaker needs 5 consecutive failed *real* attempts for a subscriber. With the default backoff (1s, 5s, 30s, ...) two events reach 5 failures only after both have made their third attempt (~7s). Firing **5 events** with outage on trips it almost immediately.
+* **Health check timing:** recovery takes up to 60s on the default `CIRCUIT_HEALTH_CHECK_INTERVAL`. For quick demos recreate the worker with `RETRY_DELAYS=1,2,3,4,5` and `CIRCUIT_HEALTH_CHECK_INTERVAL=10`.
+* **Outage state is not obvious from `/toggle-outage`:** it only flips. Use `GET /outage` (or the dashboard toggle) to read the real state.
+* **Duplicate paste in a component** produced a `"use client" directive must be placed before other expressions` build error. The file must contain the component once, with `"use client";` as line 1 (`grep -c "use client" <file>` should print 1).
+* **Event type must match a subscription**, otherwise the event is `no_subscribers`.
+* **Restarts:** the API, workers and demo subscriber do not hot-reload Python. Restart the relevant container after code changes. The dashboard hot-reloads.
+
+---
+
+# Week 4 — Day 0–3 Completion Checklist
+
+```text
+Day 0
+    ✅ CORS for the dashboard origin
+    ✅ GET /delivery-attempts (limit, since, joined names/types)
+    ✅ GET /stats (totals, success rate, p50/p99, dead letters)
+    ✅ GET /stats/subscribers (windowed per-subscriber success rate)
+    ✅ Success rate counts real attempts only (attempt_number > 0)
+    ✅ Endpoints verified with curl
+
+Day 1
+    ✅ Dashboard scaffold (default Next.js page replaced)
+    ✅ NEXT_PUBLIC_API_URL configured
+    ✅ lib/api.ts
+    ✅ SubscriberList with status badges and success rate
+    ✅ Loading / error / empty states
+    ✅ Badge flip verified
+
+Day 2
+    ✅ LiveFeed table polling every 2s
+    ✅ Status colors, attempt labels, latency column
+    ✅ Row tooltips explaining retry/deferred/failed states
+    ✅ Live behavior verified (failures, deferred, recovery)
+
+Day 3
+    ✅ GET /outage on the demo subscriber
+    ✅ /api/outage proxy route
+    ✅ OutageToggle (Kill / Restore, live state)
+    ✅ EventForm (type, count, JSON payload, unique idempotency keys)
+    ✅ Full kill-and-recover demo from the browser verified
+```
+
+---
+
+# Current Position
+
+```text
+Phase 0 — Setup                         ✅
+Week 1 — Foundation                     ✅
+Week 2 — Delivery Pipeline + HMAC       ✅
+Week 3 — Reliability                    ✅
+Week 4 — Dashboard
+    Day 0  Backend read endpoints       ✅
+    Day 1  Scaffold + subscriber list   ✅
+    Day 2  Live delivery feed           ✅
+    Day 3  Event form + outage toggle   ✅
+    Day 4  Replay UI + stats strip      ⏭ next
+    Day 5  Polish + "How this works"    pending
+```
+
+## Current Position: Week 4 — Day 3 COMPLETED ✅
+
+# Next Step — Week 4 Day 4: Replay UI + Stats Strip
+
+```text
+Stats strip (top of page)
+    Uses GET /stats: total events, success rate, p50/p99 latency.
+    Handle null values (no attempts yet) and poll every few seconds.
+
+Replay UI
+    GET /dead-letters exists but returns only ids and reason; join with
+    the subscribers list (/stats/subscribers) for subscriber names, and
+    with event data as needed.
+    Replay button calls POST /dead-letters/{id}/replay (browser -> API,
+    CORS already allows it).
+    Dead letters stay listed after a successful replay (the record is
+    kept for history); consider showing replayed state in the UI, e.g.
+    from the feed's replay rows (attempt_number <= 0).
+```
+
+Then **Day 5**: responsive layout pass, better empty/loading states, replace `title` tooltips with proper "How this works" callouts.
+
+## Reminders for the next chat
+
+* Continue from the current implementation; do not redesign the schema or worker.
+* Dashboard files live in `dashboard/src/` (`app/`, `components/`, `lib/`); API routers in `api/app/routes/`.
+* Week 5 will need: the CORS origin list updated for the deployed dashboard, `NEXT_PUBLIC_API_URL` and `DEMO_SUBSCRIBER_URL` set per environment, and the dashboard Dockerfile switched from `npm run dev` to a production build.
