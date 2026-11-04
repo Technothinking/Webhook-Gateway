@@ -7077,28 +7077,245 @@ Week 4 — Dashboard
 
 ## Current Position: Week 4 — Day 3 COMPLETED ✅
 
-# Next Step — Week 4 Day 4: Replay UI + Stats Strip
+# Week 4 — Dashboard (Day 4–5)
+
+## Status: Day 4–5 COMPLETED ✅ (Week 4 COMPLETED ✅)
+
+Day 4 added the stats strip and a dead-letter panel with replay. Day 5 was the polish pass: "How this works" callouts, skeleton loading states, empty states and a responsive layout.
+
+The full "kill and recover" demo, including dead-letter replay, now runs from the browser with zero terminal commands.
+
+No database schema change was made. No worker or scheduler code was touched.
+
+---
+
+# Day 4 — Stats strip + Replay UI
+
+## Files
 
 ```text
-Stats strip (top of page)
-    Uses GET /stats: total events, success rate, p50/p99 latency.
-    Handle null values (no attempts yet) and poll every few seconds.
-
-Replay UI
-    GET /dead-letters exists but returns only ids and reason; join with
-    the subscribers list (/stats/subscribers) for subscriber names, and
-    with event data as needed.
-    Replay button calls POST /dead-letters/{id}/replay (browser -> API,
-    CORS already allows it).
-    Dead letters stay listed after a successful replay (the record is
-    kept for history); consider showing replayed state in the UI, e.g.
-    from the feed's replay rows (attempt_number <= 0).
+api/app/schemas/dead_letter.py           (added DeadLetterFeedItem; DeadLetterResponse kept)
+api/app/routes/dead_letters.py           (list endpoint enriched; replay endpoint unchanged)
+dashboard/src/lib/api.ts                 (added Stats, DeadLetterItem + fetch helpers)
+dashboard/src/components/StatsStrip.tsx  (new)
+dashboard/src/components/DeadLetters.tsx (new)
+dashboard/src/app/page.tsx               (stats strip on top, Dead letters section)
 ```
 
-Then **Day 5**: responsive layout pass, better empty/loading states, replace `title` tooltips with proper "How this works" callouts.
+## Enriched GET /dead-letters
+
+The original endpoint returned only ids and the failure reason. Instead of joining several endpoints in the browser, the backend now returns everything the UI needs in one call.
+
+```text
+Query param
+    limit   default 50, min 1, max 200
+Ordering
+    moved_at DESC
+Response item (DeadLetterFeedItem)
+    id, event_id, event_type, subscriber_id, subscriber_name,
+    failed_reason, moved_at, replay_count, delivered
+```
+
+How the derived fields are computed (one extra query for all listed events):
+
+```text
+replay_count   number of attempts for (event, subscriber) with attempt_number <= 0
+               (the -1 deferred placeholder is excluded)
+delivered      true if any attempt for (event, subscriber) has status = success
+```
+
+`POST /dead-letters/{id}/replay` and the `DeadLetterResponse` schema are unchanged.
+
+The dead-letter record is never deleted. A successful replay changes what the UI shows, not the record itself.
+
+## StatsStrip
+
+Polls `GET /stats` every 3s and shows five cards:
+
+```text
+Total events, Success rate, p50 latency, p99 latency, Dead letters
+Null handling   success rate and latencies show "n/a" until attempts exist
+Hints           title tooltips on success rate and latency cards
+States handled  loading, error (API unreachable)
+```
+
+## DeadLetters panel
+
+Polls `GET /dead-letters` every 3s. Table columns: Moved, Event, Subscriber, Reason, State, action button.
+
+```text
+State column
+    ✅ Delivered                       a replay (or later attempt) succeeded
+    Replayed N×, not delivered         replay(s) failed
+    Failed                             never replayed
+Button
+    Replay / Replay again / hidden once delivered
+Replay action
+    browser -> POST /dead-letters/{id}/replay (CORS already allows it)
+    notice: "Replay queued: a worker will deliver it shortly"
+```
+
+## Verification
+
+Single-event test, outage on: the event retries five times, becomes a dead letter, then **Restore** + **Replay** flips the row to ✅ Delivered and a green `replay` row appears in the live feed. Confirmed working.
+
+---
+
+# Things learned during Day 4
+
+* **The circuit breaker counts across events, not per event.** It looks at the subscriber's last 5 real attempts, whatever event they belong to. Two events in outage mode (3 + 2 failures) made 5 consecutive failures, so the subscriber went `degraded` before either event reached attempt 5. Both stayed `pending_retry` with `next_retry_at` in the past, because the scheduler only picks up rows for `active` subscribers. They resume once the circuit closes. Nothing is lost.
+* **How to get a dead letter in a demo:** kill the subscriber and send **exactly 1 event**. Its 5 attempts fail in sequence, and the dead letter is written (`move_to_dead_letter`) before `check_circuit_breaker` runs on that final attempt. With `RETRY_DELAYS=1,2,3,4,5` it takes about 15 seconds.
+* **Retries and the breaker interact.** While a subscriber is down, the breaker usually opens before retries exhaust, so events wait for recovery instead of dead-lettering. Dead letters mostly come from failures that happen while the circuit is closed (for example, a subscriber that errors on specific payloads). Worth a line in the Week 5 design-decisions doc.
+* **The breaker threshold was deliberately left hard-coded at 5** (not made configurable).
+* **A successful replay does not raise the success rate**, because replays (`attempt_number <= 0`) are excluded by design. The stats tooltip says so.
+* **Replay against a still-down subscriber** records a failed attempt (0, -2, ...). Nothing retries it automatically, and the UI shows "Replayed N×, not delivered" with a "Replay again" button.
+
+---
+
+# Day 5 — Polish + "How this works"
+
+## Files
+
+```text
+dashboard/src/components/Hint.tsx          (new)
+dashboard/src/components/Section.tsx       (new)
+dashboard/src/components/Skeleton.tsx      (new)
+dashboard/src/app/page.tsx                 (rewritten with Section callouts)
+dashboard/src/components/LiveFeed.tsx      (rewritten)
+dashboard/src/components/StatsStrip.tsx    (skeleton loading)
+dashboard/src/components/SubscriberList.tsx(skeleton, empty state, mobile layout)
+dashboard/src/components/DeadLetters.tsx   (skeleton, empty state, mobile layout)
+dashboard/src/components/EventForm.tsx     (mobile layout)
+dashboard/src/components/OutageToggle.tsx  (mobile layout)
+```
+
+## Shared components
+
+```text
+Hint       small ⓘ button with a hover/focus popover (keyboard accessible);
+           used for column headers
+Section    heading plus a native <details> "How this works" callout (no JS,
+           works on touch); used for every page section
+Skeleton   animated placeholder block for loading states
+```
+
+The `title` tooltips from Day 2 were replaced. Hover tooltips do not work on touch screens, so the retry/deferred/failed explanations are now **visible text** under each status in the feed.
+
+## Live feed changes
+
+```text
+Explanations    shown under the status, e.g. "Backing off: next attempt in ~Ns",
+                "Circuit open: held until the subscriber recovers",
+                "Retries exhausted: moved to dead letters", "Replay failed"
+Backoff over    when next_retry_at has passed but the row is still pending_retry:
+                "waiting for the retry scheduler or an active subscriber"
+Connection      if polling fails after data has loaded, a banner says
+                "Connection lost, showing the last data" instead of blanking
+Attempt hint    ⓘ explaining #1–#5, replay and deferred
+```
+
+## Section callouts
+
+Controls, Subscribers, Live deliveries and Dead letters each have a collapsible explanation covering Kill/Restore, the status badges and the circuit breaker, retries and deferred/replay rows, and the dead-letter queue and replay semantics.
+
+## Loading and empty states
+
+```text
+Loading         skeletons (stats strip, subscribers, feed, dead letters)
+Empty           dashed-border panels with guidance
+                subscribers: run the seed script
+                feed: use Send event
+                dead letters: nothing has permanently failed
+Error           unchanged: red "Can't reach API" before first load
+```
+
+## Responsive pass
+
+```text
+Page padding        p-4 on mobile, p-8 from sm up
+Feed table          Event and Latency columns hidden below sm
+Dead-letter table   Reason column hidden below sm
+Subscriber rows     stack vertically on mobile
+Event form          type and count stack on mobile
+Outage toggle       stacks on mobile
+Tables              scroll inside their own container (no page-level horizontal scroll)
+```
+
+## Known limits
+
+* The `Hint` popover is left-aligned, so one placed at the far right edge of a narrow screen could clip. Only the Attempt header uses it, and it sits mid-row.
+* The dashboard Dockerfile still runs `npm run dev`. That is a Week 5 deployment item.
+
+---
+
+# Week 4 — Day 4–5 Completion Checklist
+
+```text
+Day 4
+    ✅ GET /dead-letters enriched (names, event type, replay_count, delivered)
+    ✅ DeadLetterFeedItem schema
+    ✅ lib/api.ts: Stats, DeadLetterItem, getStats, getDeadLetters, replayDeadLetter
+    ✅ StatsStrip (total events, success rate, p50/p99, dead letters)
+    ✅ DeadLetters panel with Replay / Replay again
+    ✅ Replayed state derived from replay rows
+    ✅ Dead-letter replay verified from the browser (single-event test)
+
+Day 5
+    ✅ Hint, Section, Skeleton components
+    ✅ "How this works" callouts on every section
+    ✅ Visible status explanations in the live feed (replaced title tooltips)
+    ✅ Skeleton loading states
+    ✅ Empty states with guidance
+    ✅ Connection-lost banner in the feed
+    ✅ Responsive layout pass
+```
+
+---
+
+# Week 4 Completion Status
+
+```text
+Week 4 — Day 0   ✅ Backend read endpoints + CORS
+Week 4 — Day 1   ✅ Scaffold + subscriber list
+Week 4 — Day 2   ✅ Live delivery feed
+Week 4 — Day 3   ✅ Event form + outage toggle
+Week 4 — Day 4   ✅ Replay UI + stats strip
+Week 4 — Day 5   ✅ Polish + "How this works" callouts
+```
+
+# Current Position
+
+```text
+Phase 0 — Setup                         ✅
+Week 1 — Foundation                     ✅
+Week 2 — Delivery Pipeline + HMAC       ✅
+Week 3 — Reliability                    ✅
+Week 4 — Dashboard                      ✅
+Week 5 — Load testing, scaling, deploy  ⏭ next
+```
+
+## Current Position: Week 4 COMPLETED ✅
+
+The entire "kill and recover" demo runs from the browser: send events, kill and restore the subscriber, watch retries and the circuit breaker, replay dead letters.
+
+# Next Step — Week 5
+
+```text
+Day 1   Horizontal worker scaling: 2–4 worker instances on one consumer group,
+        verified with a test that no event is double-processed
+Day 2   Load test (Locust or k6): ingest throughput and latency, end-to-end
+        delivery latency, zero-duplicate check across the run. Save the results:
+        the resume numbers come from here.
+Day 3   Deployment: managed Postgres/Redis, API + workers + dashboard as
+        services, GitHub Actions (test, build, deploy), seeded live instance
+Day 4   README (architecture diagram, quickstart, results) + demo GIF
+Day 5   docs/design-decisions.md + resume bullets from the measured numbers
+```
 
 ## Reminders for the next chat
 
 * Continue from the current implementation; do not redesign the schema or worker.
 * Dashboard files live in `dashboard/src/` (`app/`, `components/`, `lib/`); API routers in `api/app/routes/`.
-* Week 5 will need: the CORS origin list updated for the deployed dashboard, `NEXT_PUBLIC_API_URL` and `DEMO_SUBSCRIBER_URL` set per environment, and the dashboard Dockerfile switched from `npm run dev` to a production build.
+* Before deployment: update the CORS origin list for the deployed dashboard, set `NEXT_PUBLIC_API_URL` and `DEMO_SUBSCRIBER_URL` per environment, and switch the dashboard Dockerfile from `npm run dev` to a production build.
+* The circuit breaker threshold is hard-coded at 5; dead-letter demos use a single event while the subscriber is down.
+* `docker-compose.yml` hard-codes `WORKER_NAME: worker-1` and `container_name` on the worker, so scaling workers (Week 5 Day 1) needs a unique consumer name per instance and the `container_name` removed.
