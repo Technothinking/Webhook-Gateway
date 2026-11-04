@@ -59,7 +59,7 @@ export default function EventForm() {
       onSubmit={submit}
       className="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800"
     >
-      <div className="flex gap-3">
+      <div className="flex flex-col gap-3 sm:flex-row">
         <label className="flex-1 text-sm">
           Event type
           <input
@@ -69,7 +69,7 @@ export default function EventForm() {
             onChange={(e) => setEventType(e.target.value)}
           />
         </label>
-        <label className="w-24 text-sm">
+        <label className="sm:w-24 text-sm">
           Count
           <input
             type="number"

@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { getDeadLetters, replayDeadLetter, DeadLetterItem } from "@/lib/api";
 
+import Skeleton from "@/components/Skeleton";
+
 export default function DeadLetters() {
   const [items, setItems] = useState<DeadLetterItem[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -38,9 +40,13 @@ export default function DeadLetters() {
   };
 
   if (error && !items) return <p className="text-red-500">Can&apos;t reach API: {error}</p>;
-  if (!items) return <p className="text-zinc-500">Loading dead letters…</p>;
+  if (!items) return <Skeleton className="h-24" />;
   if (items.length === 0)
-    return <p className="text-zinc-500">No dead letters. Nothing has permanently failed.</p>;
+    return (
+      <div className="rounded-lg border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-500 dark:border-zinc-700">
+        No dead letters. Nothing has permanently failed.
+      </div>
+    );
 
   return (
     <div className="space-y-2">
@@ -52,7 +58,7 @@ export default function DeadLetters() {
               <th className="p-2">Moved</th>
               <th className="p-2">Event</th>
               <th className="p-2">Subscriber</th>
-              <th className="p-2">Reason</th>
+              <th className="hidden sm:table-cell">Reason</th>
               <th className="p-2">State</th>
               <th className="p-2" />
             </tr>
@@ -65,7 +71,7 @@ export default function DeadLetters() {
                 </td>
                 <td className="p-2">{d.event_type}</td>
                 <td className="p-2">{d.subscriber_name}</td>
-                <td className="max-w-xs truncate p-2 text-zinc-500" title={d.failed_reason}>
+                <td className="hidden sm:table-cell" title={d.failed_reason}>
                   {d.failed_reason}
                 </td>
                 <td className="p-2 whitespace-nowrap">

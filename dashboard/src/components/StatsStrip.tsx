@@ -3,6 +3,8 @@
 import { useEffect, useState } from "react";
 import { getStats, Stats } from "@/lib/api";
 
+import Skeleton from "@/components/Skeleton";
+
 function Card({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return (
     <div
@@ -41,7 +43,14 @@ export default function StatsStrip() {
   }, []);
 
   if (error && !stats) return <p className="text-red-500">Can&apos;t reach API: {error}</p>;
-  if (!stats) return <p className="text-zinc-500">Loading stats…</p>;
+  if (!stats)
+  return (
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+        {Array.from({ length: 5 }).map((_, i) => (
+          <Skeleton key={i} className="h-16" />
+        ))}
+      </div>
+    );
 
   const ms = (v: number | null) => (v === null ? "n/a" : `${v} ms`);
 

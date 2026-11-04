@@ -39,7 +39,7 @@ export default function OutageToggle() {
   };
 
   return (
-    <div className="flex items-center justify-between rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+    <div className="flex flex-col gap-3 rounded-lg border border-zinc-200 p-4 sm:flex-row sm:items-center sm:justify-between dark:border-zinc-800">
       <div>
         <p className="font-medium">Demo subscriber</p>
         <p className="text-sm text-zinc-500">
