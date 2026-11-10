@@ -35,11 +35,9 @@ services:
   worker:
     build:
       context: ./api
-    container_name: webhook-worker
     environment:
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL}
-      WORKER_NAME: worker-1
       PYTHONPATH: /app
       # Defaults match production behaviour; override for quick demos, e.g.
       #   set RETRY_DELAYS=1,2,3,4,5

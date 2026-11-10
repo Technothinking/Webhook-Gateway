@@ -11,6 +11,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 HEALTHY_WEBHOOK_SECRET = os.getenv("HEALTHY_WEBHOOK_SECRET")
 OUTAGE_MODE = False
 
+RECEIVED: dict[str, int] = {}
 
 @app.get("/")
 def health_check():
@@ -73,6 +74,7 @@ async def receive_webhook(
     request: Request,
     x_webhook_signature: str | None = Header(default=None),
     x_webhook_timestamp: str | None = Header(default=None),
+    x_webhook_health_check: str | None = Header(default=None),
 ):
     if OUTAGE_MODE:
         raise HTTPException(
@@ -87,6 +89,10 @@ async def receive_webhook(
         WEBHOOK_SECRET,
     )
 
+    if not x_webhook_health_check:
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        RECEIVED[digest] = RECEIVED.get(digest, 0) + 1
+    
     print(
         f"Webhook received successfully: "
         f"timestamp={x_webhook_timestamp}, "
@@ -138,3 +144,18 @@ def toggle_outage():
     return {
         "outage_mode": OUTAGE_MODE
     }
+
+@app.get("/received")
+def get_received():
+    total = sum(RECEIVED.values())
+    return {
+        "total": total,
+        "unique": len(RECEIVED),
+        "duplicates": total - len(RECEIVED),
+    }
+
+
+@app.post("/received/reset")
+def reset_received():
+    RECEIVED.clear()
+    return {"status": "reset"}

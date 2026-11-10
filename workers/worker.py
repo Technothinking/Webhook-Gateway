@@ -19,6 +19,7 @@ from app.models.subscriber import Subscriber
 from app.models.subscription import Subscription
 from app.models.dead_letter import DeadLetter
 
+import socket
 
 from dotenv import load_dotenv
 
@@ -29,7 +30,7 @@ REDIS_URL = os.getenv("REDIS_URL")
 
 EVENT_STREAM = "webhook_events"
 CONSUMER_GROUP = "delivery_workers"
-CONSUMER_NAME = os.getenv("WORKER_NAME", "worker-1")
+CONSUMER_NAME = os.getenv("WORKER_NAME") or f"worker-{socket.gethostname()}"
 
 redis_client = redis.from_url(
     REDIS_URL,
@@ -530,6 +531,17 @@ async def run_health_checks():
 
             for subscriber in subscribers:
 
+                lock_ttl = max(1, CIRCUIT_HEALTH_CHECK_INTERVAL - 1)
+                got_lock = await redis_client.set(
+                    f"health_check_lock:{subscriber.id}",
+                    CONSUMER_NAME,
+                    nx=True,
+                    ex=lock_ttl,
+                )
+
+                if not got_lock:
+                    continue
+
                 await health_check_subscriber(
                     db,
                     subscriber
@@ -1005,7 +1017,7 @@ async def process_message(message_id, data) -> bool:
 
     print(
         f"Received event: {event_id} "
-        f"(message_id={message_id})"
+        f"(message_id={message_id}, consumer={CONSUMER_NAME})"
     )
 
     if subscriber_id:
@@ -1042,6 +1054,8 @@ async def process_message(message_id, data) -> bool:
         CONSUMER_GROUP,
         message_id
     )
+
+    await redis_client.hincrby("worker_processed", CONSUMER_NAME, 1)
 
     print(
         f"ACKed message: {message_id}"
