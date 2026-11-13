@@ -2,6 +2,11 @@ import asyncio
 import os
 from datetime import datetime, timezone
 
+import time
+from datetime import timedelta
+from sqlalchemy import exists
+from app.models.event import Event
+
 import redis.asyncio as redis
 from sqlalchemy import select
 
@@ -24,6 +29,11 @@ POLL_INTERVAL_SECONDS = 1
 # 'deferred'      : an event parked while the subscriber was degraded
 SCHEDULABLE_STATUSES = ("pending_retry", "deferred")
 
+# An event still 'pending' with no attempt rows after this long was most
+# likely never published (API crashed or Redis failed after the commit).
+RECONCILE_AFTER_SECONDS = int(os.getenv("RECONCILE_AFTER_SECONDS", "60"))
+RECONCILE_INTERVAL_SECONDS = 10
+RECONCILE_GUARD_TTL_SECONDS = 600
 
 redis_client = redis.from_url(
     REDIS_URL,
@@ -97,9 +107,9 @@ async def schedule_due_retries():
 
 async def run_scheduler():
 
-    print(
-        "Retry scheduler started..."
-    )
+    print("Retry scheduler started...")
+
+    last_reconcile = 0.0
 
     while True:
 
@@ -107,16 +117,57 @@ async def run_scheduler():
 
             await schedule_due_retries()
 
+            if time.monotonic() - last_reconcile >= RECONCILE_INTERVAL_SECONDS:
+                last_reconcile = time.monotonic()
+                await reconcile_unpublished_events()
+
         except Exception as exc:
 
-            print(
-                f"Retry scheduler error: {exc}"
-            )
+            print(f"Retry scheduler error: {exc}")
 
-        await asyncio.sleep(
-            POLL_INTERVAL_SECONDS
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+async def reconcile_unpublished_events():
+    db = SessionLocal()
+
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=RECONCILE_AFTER_SECONDS
         )
 
+        event_ids = db.scalars(
+            select(Event.id)
+            .where(
+                Event.status == "pending",
+                Event.published_at.is_(None),
+                Event.created_at <= cutoff,
+                ~exists().where(DeliveryAttempt.event_id == Event.id),
+            )
+            .order_by(Event.created_at)
+            .limit(100)
+        ).all()
+
+        for event_id in event_ids:
+            # Republish each event at most once per guard window
+            claimed = await redis_client.set(
+                f"reconciled:{event_id}",
+                "1",
+                nx=True,
+                ex=RECONCILE_GUARD_TTL_SECONDS,
+            )
+
+            if not claimed:
+                continue
+
+            await redis_client.xadd(
+                EVENT_STREAM,
+                {"event_id": str(event_id)}
+            )
+
+            print(f"Reconciled unpublished event: {event_id}")
+
+    finally:
+        db.close()
 
 async def main():
 
