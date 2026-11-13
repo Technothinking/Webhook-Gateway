@@ -38,3 +38,21 @@ def test_event_idempotency(client):
     # Both responses should refer to the same event
     assert event1["id"] == event2["id"]
     assert event1["idempotency_key"] == event2["idempotency_key"]
+
+def test_event_is_kept_when_publish_fails(client, monkeypatch):
+    async def redis_down(*args, **kwargs):
+        raise RuntimeError("redis down")
+
+    monkeypatch.setattr("app.routes.events.publish_event", redis_down)
+
+    response = client.post(
+        "/events/",
+        json={
+            "event_type": "order.created",
+            "payload": {"a": 1},
+            "idempotency_key": f"test-publish-fail-{uuid.uuid4()}",
+        },
+    )
+
+    assert response.status_code == 201
+    assert client.get(f"/events/{response.json()['id']}").status_code == 200
