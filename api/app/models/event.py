@@ -20,6 +20,7 @@ class Event(Base):
 
     delivery_attempts: Mapped[list["DeliveryAttempt"]] = relationship(back_populates="event")
     dead_letters: Mapped[list["DeadLetter"]] = relationship(back_populates="event")
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     def __repr__(self):
         return (

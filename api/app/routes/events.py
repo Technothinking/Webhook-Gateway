@@ -1,9 +1,13 @@
+import logging
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, status, Response, HTTPException
+from fastapi import Query
+from fastapi.concurrency import run_in_threadpool
+
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-from uuid import UUID
-from fastapi import Query
 
 from app.db.session import get_db
 from app.models.event import Event
@@ -11,7 +15,54 @@ from app.schemas.event import EventCreate, EventResponse
 
 from app.redis.publisher import publish_event
 
+from datetime import datetime, timezone
+from sqlalchemy import update
+from app.db.session import SessionLocal
+
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/events", tags=["Events"])
+
+def _insert_event(db: Session, event: EventCreate) -> tuple[EventResponse, bool]:
+    """
+    All blocking DB work for ingest. Runs in a worker thread so it never
+    stalls the event loop, and releases its connection before returning so
+    nothing is held while the caller talks to Redis.
+    Returns (event, created).
+    """
+    try:
+        existing = db.scalar(
+            select(Event).where(Event.idempotency_key == event.idempotency_key)
+        )
+        if existing is not None:
+            return EventResponse.model_validate(existing), False
+
+        db_event = Event(**event.model_dump())
+        db.add(db_event)
+
+        try:
+            db.commit()
+            db.refresh(db_event)
+        except IntegrityError:
+            # A concurrent request inserted the same key first.
+            db.rollback()
+            existing = db.scalar(
+                select(Event).where(Event.idempotency_key == event.idempotency_key)
+            )
+            return EventResponse.model_validate(existing), False
+
+        return EventResponse.model_validate(db_event), True
+    finally:
+        db.close()
+
+def _mark_published(event_id) -> None:
+    with SessionLocal() as db:
+        db.execute(
+            update(Event)
+            .where(Event.id == event_id)
+            .values(published_at=datetime.now(timezone.utc))
+        )
+        db.commit()
 
 
 @router.post("/", response_model=EventResponse)
@@ -20,47 +71,22 @@ async def create_event(
     response: Response,
     db: Session = Depends(get_db)
 ):
-    # First check for an existing event
-    stmt = select(Event).where(
-        Event.idempotency_key == event.idempotency_key
-    )
+    result, created = await run_in_threadpool(_insert_event, db, event)
 
-    result = db.execute(stmt)
-    existing_event = result.scalar_one_or_none()
-
-    # Duplicate request
-    if existing_event:
+    if not created:
         response.status_code = status.HTTP_200_OK
-        return existing_event
+        return result
 
-    # Create new event
-    db_event = Event(**event.model_dump())
-    db.add(db_event)
-
+    # The event is already durable. If the publish fails, do not fail the
+    # request: the reconciler in the retry scheduler republishes it.
     try:
-        db.commit()
-        db.refresh(db_event)
+        await publish_event(str(result.id))
+        await run_in_threadpool(_mark_published, result.id)
+    except Exception:
+        logger.exception("publish failed for event %s; reconciler will retry", result.id)
 
-        # Publish only newly created events
-        await publish_event(str(db_event.id))
-
-        response.status_code = status.HTTP_201_CREATED
-        return db_event
-
-    except IntegrityError:
-        # Another concurrent request inserted the same
-        # idempotency key before this transaction committed.
-        db.rollback()
-
-        stmt = select(Event).where(
-            Event.idempotency_key == event.idempotency_key
-        )
-
-        result = db.execute(stmt)
-        existing_event = result.scalar_one()
-
-        response.status_code = status.HTTP_200_OK
-        return existing_event
+    response.status_code = status.HTTP_201_CREATED
+    return result
 
 @router.get("/{event_id}", response_model=EventResponse)
 def get_event(
