@@ -1,0 +1,28 @@
+{
+  "event_type": "load.207529e8",
+  "events": 19783,
+  "delivered": 19783,
+  "duplicate_success_events": 0,
+  "attempt_statuses": {
+    "success": 19783
+  },
+  "server_side_ingest_rps": 130.0,
+  "e2e_latency_ms": {
+    "p50": 259216.1,
+    "p95": 451972.8,
+    "p99": 469982.0,
+    "max": 474251.6
+  },
+  "drain_seconds_after_last_ingest": 474.22,
+  "delivery_throughput_per_s": 31.6,
+  "receiver": {
+    "total": 19783,
+    "unique": 19783,
+    "duplicates": 0
+  },
+  "stream_pending": 0,
+  "messages_per_consumer": {
+    "worker-69c9dbdb744d": 19783
+  },
+  "pass": true
+}

@@ -1,0 +1,29 @@
+{
+  "event_type": "load.4ba2d1f7",
+  "events": 78,
+  "delivered": 74,
+  "duplicate_success_events": 0,
+  "attempt_statuses": {
+    "success": 74
+  },
+  "server_side_ingest_rps": 0.6,
+  "e2e_latency_ms": {
+    "p50": 69.3,
+    "p95": 185.0,
+    "p99": 199.8,
+    "max": 209.3
+  },
+  "drain_seconds_after_last_ingest": 0.05,
+  "receiver": {
+    "total": 74,
+    "unique": 1,
+    "duplicates": 73
+  },
+  "stream_pending": 0,
+  "messages_per_consumer": {
+    "worker-b282bc2ae64a": 24,
+    "worker-69c9dbdb744d": 25,
+    "worker-5096ec91432e": 25
+  },
+  "pass": false
+}
