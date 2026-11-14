@@ -7319,3 +7319,318 @@ Day 5   docs/design-decisions.md + resume bullets from the measured numbers
 * Before deployment: update the CORS origin list for the deployed dashboard, set `NEXT_PUBLIC_API_URL` and `DEMO_SUBSCRIBER_URL` per environment, and switch the dashboard Dockerfile from `npm run dev` to a production build.
 * The circuit breaker threshold is hard-coded at 5; dead-letter demos use a single event while the subscriber is down.
 * `docker-compose.yml` hard-codes `WORKER_NAME: worker-1` and `container_name` on the worker, so scaling workers (Week 5 Day 1) needs a unique consumer name per instance and the `container_name` removed.
+
+# Webhook Reliability Gateway — Week 5, Day 1–2 (addendum)
+
+This section continues "Completed until now.md". Everything in that file (Phase 0 through Week 4) is unchanged and still true unless this addendum says otherwise. The one deliberate schema change is described under Day 2 (`event.published_at`).
+
+## Status
+
+```text
+Week 5 — Day 1   ✅ Horizontal worker scaling
+Week 5 — Day 2   ✅ Load testing (plus two reliability fixes it exposed)
+Week 5 — Day 3   ⏭ next: deployment
+Week 5 — Day 4   pending: README + demo GIF
+Week 5 — Day 5   pending: design-decisions doc + resume bullets
+```
+
+Headline result: about 125,000 events across 7 load runs, with zero lost events and zero duplicate deliveries, verified in the database and at the receiver.
+
+---
+
+# Week 5 — Day 1: Horizontal worker scaling
+
+## Goal
+
+Run several worker instances on the same Redis consumer group and prove events are not double-processed.
+
+## What blocked scaling
+
+| Problem | Fix |
+|---|---|
+| `container_name: webhook-worker` stopped Compose from starting replicas | Removed from the `worker` service |
+| `WORKER_NAME: worker-1` hard-coded, so every replica would be the same Redis consumer | Removed from compose. The consumer name is now `WORKER_NAME` if set, otherwise `worker-<container hostname>` |
+| Every replica ran the circuit-breaker health-check loop, so N replicas probed the same degraded subscriber at once | Per-subscriber Redis lock `health_check_lock:<subscriber_id>`, `SET NX EX max(1, CIRCUIT_HEALTH_CHECK_INTERVAL - 1)` |
+| No way to see how work was split | `HINCRBY worker_processed <consumer> 1` after each ACK, and the consumer name is in the "Received event" log line |
+| No receiver-side duplicate check | The demo subscriber now counts what it receives (see below) |
+
+`retry-scheduler` is intentionally still a single instance. Two schedulers would publish the same retry twice.
+
+## Files changed
+
+```text
+workers/worker.py                (modified: consumer name, worker_processed counter, health-check lock)
+docker-compose.yml               (modified: worker service has no container_name / WORKER_NAME)
+demo-subscriber/app.py           (modified: receiver counters, see below)
+api/scripts/scale_test.py        (new)
+```
+
+## Demo subscriber: receiver counters
+
+```text
+RECEIVED   in-memory dict: sha256(payload) -> times received
+Counted    every successfully verified POST /webhook, except health checks
+           (requests with X-Webhook-Health-Check)
+GET  /received         {"total", "unique", "duplicates"}
+POST /received/reset   clears the counters
+```
+
+Notes:
+* Counters are in memory, so they reset when the container restarts.
+* Duplicates are detected by payload hash, so every test event must have a unique payload (the Locust payload has a `seq` field for this).
+
+## How to scale and test
+
+```bash
+docker compose up -d --scale worker=3 worker
+docker compose restart demo-subscriber
+docker compose exec -e WEBHOOK_SECRET=<value from .env> -e EXPECT_WORKERS=3 worker python /app/scripts/scale_test.py
+```
+
+`scale_test.py` registers a subscriber for a fresh event type, fires `SCALE_EVENTS` events (default 200), and checks:
+
+```text
+1. exactly one success per event in the database
+2. total attempts == events (no extra attempt rows)
+3. receiver total == events and duplicates == 0
+4. stream XPENDING == 0
+5. more than one consumer did work (when EXPECT_WORKERS > 1)
+```
+
+Optional env: `SCALE_EVENTS`, `EXPECT_WORKERS`, `SCALE_TIMEOUT` (120), `DEMO_API_URL`, `DEMO_FLAKY_URL`.
+
+## Result
+
+```text
+200 events, 3 workers
+db: delivered=200/200, duplicate_successes=0, total_attempts=200
+receiver: total=200 unique=200 duplicates=0
+stream: pending=0
+messages per consumer: 66 / 67 / 67
+RESULT: PASS - no double processing
+```
+
+---
+
+# Week 5 — Day 2: Load testing
+
+## Tooling
+
+Locust 2.47.0 runs on the host (Windows) against `http://localhost:8000`. Two helper commands run inside the worker container because they need database and Docker-network access.
+
+```text
+loadtest/requirements.txt     (new: locust)
+loadtest/locustfile.py        (new)
+api/scripts/loadtest.py       (new: `setup` and `report <event_type>`)
+api/loadtest_results/*.json   (generated: one JSON per run, on the host via the ./api mount)
+```
+
+### locustfile.py
+
+```text
+Env     LOAD_EVENT_TYPE (required), LOAD_TARGET_RPS (50),
+        LOAD_RAMP_S (20), LOAD_HOLD_S (60)
+User    Producer(FastHttpUser), wait_time = constant_throughput(1)
+        -> one user sends one event per second, so users ~= requests per second
+Event   payload {"load_run", "seq": uuid, "amount"}, idempotency key "<run>-<uuid>",
+        201 = success, anything else = failure
+Shape   RampAndHold: linear ramp, then hold. Stats are reset when the hold starts,
+        so Locust numbers cover the steady-state hold only
+```
+
+The real runs used `LOAD_RAMP_S=30` and `LOAD_HOLD_S=120`. The smoke run used 5 and 15. Locust is closed-loop, so when the API saturates it does not reach the target rate; the extra users just wait longer.
+
+### loadtest.py
+
+```text
+setup            turns demo-subscriber outage off, resets receiver counters and the
+                 worker_processed hash, registers a subscriber with the secret the
+                 demo receiver expects, subscribes it to a fresh event type
+                 load.<8 hex chars>, prints that event type
+report <type>    waits for deliveries to drain (LOAD_DRAIN_TIMEOUT, raised from
+                 300 to 900 s), then computes and saves results
+```
+
+The report JSON contains: `events`, `delivered`, `duplicate_success_events`, `attempt_statuses`, `server_side_ingest_rps` (includes the ramp), `e2e_latency_ms` (p50/p95/p99/max, success `attempted_at` minus `event.created_at`), `drain_seconds_after_last_ingest`, `delivery_throughput_per_s` (delivered / (last success − first event created)), `receiver`, `stream_pending`, `messages_per_consumer`, `pass`.
+
+`pass` requires: all events delivered, no duplicate successes, only `success` attempts, receiver total == events with 0 duplicates, and stream pending == 0.
+
+Run sequence (cmd on Windows):
+
+```bat
+docker compose exec -e WEBHOOK_SECRET=<value from .env> worker python /app/scripts/loadtest.py setup
+set LOAD_EVENT_TYPE=load.xxxxxxxx
+set LOAD_TARGET_RPS=100
+set LOAD_RAMP_S=30
+set LOAD_HOLD_S=120
+locust -f loadtest/locustfile.py --headless --host http://localhost:8000
+docker compose exec -e WEBHOOK_SECRET=<value from .env> worker python /app/scripts/loadtest.py report load.xxxxxxxx
+```
+
+`--csv loadtest/results/<name>` also works, but the directory must exist first.
+
+---
+
+## Problems the load test found, and the fixes
+
+### 1. False duplicates (test bug)
+
+The first smoke report showed "73 duplicates" at the receiver. Every Locust payload was identical, so every delivery hashed to the same value. The database check was clean (`duplicate_success_events: 0`). Fix: a unique `seq` field in the payload.
+
+### 2. Stranded events and an API stall (real bug)
+
+The same smoke run delivered 74 of 78 events, and Locust froze after 21 requests. The 4 missing events were committed to Postgres but never published to the Redis stream.
+
+Root cause (from the API logs):
+
+* `create_event` was an `async def` that made blocking SQLAlchemy calls directly on the event loop.
+* It held a DB connection across `await publish_event(...)`.
+* The pool was 5 + 10 connections, so under concurrency it hit `QueuePool limit ... reached` (30 s timeout), which blocked the loop and stalled the Redis calls that would have released the connections. Redis publishes then timed out.
+* Because commit and publish were two separate steps, any failed publish left the event `pending` with no stream message, forever.
+
+Fixes:
+
+```text
+api/app/routes/events.py
+    _insert_event(db, event) does all blocking DB work and runs via run_in_threadpool.
+    It closes its session in `finally` and returns (EventResponse, created).
+    A failed publish no longer fails the request: it is logged, and the event stays
+    stored for the reconciler to republish.
+api/app/redis/client.py
+    socket_connect_timeout=2, socket_timeout=5, health_check_interval=30
+api/app/db/database.py
+    pool_size=20, max_overflow=20, pool_pre_ping=True
+workers/retry_scheduler.py
+    reconcile_unpublished_events(), run every 10 s from the scheduler loop (see below)
+api/tests/test_events.py
+    test_event_is_kept_when_publish_fails
+```
+
+The 4 stranded events were republished by the reconciler and all 78 events ended `delivered`. The smoke re-run then passed.
+
+### 3. The reconciler republished events that were only queued
+
+The first version of the reconciler treated any event that was `pending`, older than 60 s and had no attempt rows as unpublished. During a delivery backlog longer than 60 s, events that were merely waiting in the stream matched that rule too, got republished, and workers processed them twice.
+
+Evidence, messages processed minus events fired:
+
+```text
+run 1:   0       (backlog never exceeded 60 s)
+run 2:  +591
+run 3:  +2,000
+run 4:  +2,149
+run 5:  +7,300
+```
+
+The fan-out idempotency guard stopped any second delivery (the receiver always showed 0 duplicates), so this was waste plus a theoretical race, not data corruption.
+
+Fix: record when an event was actually published.
+
+```text
+event.published_at           new nullable timestamptz column
+Alembic migration            "add event published_at"; the migration also runs
+                             UPDATE event SET published_at = created_at
+                             so existing events are never republished
+api/app/models/event.py      published_at mapped column
+api/app/routes/events.py     _mark_published(event_id): separate SessionLocal, via
+                             run_in_threadpool, called after a successful publish
+workers/retry_scheduler.py   reconciler now also requires Event.published_at IS NULL
+```
+
+The reconciler keeps its Redis guard key `reconciled:<event_id>` (NX, 600 s TTL) and its limit of 100 events per pass. `RECONCILE_AFTER_SECONDS` defaults to 60.
+
+Cost: the extra write reduces ingest throughput by about 18 to 19% (168 to 137 rps with 1 worker, 145.5 to 117.8 with 3).
+
+Validation: in the two runs after the fix, messages processed per consumer sum exactly to the number of events.
+
+---
+
+## Results
+
+Environment: one Windows laptop with Docker Desktop. The API (single uvicorn process), Postgres, Redis, the demo receiver, the workers, the retry scheduler and Locust all share that machine. Ingest numbers are Locust hold-phase only. Rows marked ≈ are derived from report timestamps; the others are measured directly.
+
+| Run | Workers | Target rps | Ingest rps | Ingest p50 / p99 | Events | Delivery /s | Drain after ingest |
+|---|---|---|---|---|---|---|---|
+| 1 | 3 | 50 | 49.8 | 120 ms / 260 ms | 6,756 | ≈39 | 23 s |
+| 2 | 3 | 100 | 100.3 | 490 ms / 700 ms | 13,532 | ≈59 | 78 s |
+| 3 | 3 | 200 | 152.0 | 1.3 s / 1.7 s | 21,152 | ≈67 | 167 s |
+| 4 | 3 | 400 | 145.5 | 2.7 s / 3.5 s | 21,578 | ≈67 | 171 s |
+| 5 | 1 | 400 | 168.3 | 2.3 s / 3.2 s | 24,309 | ≈30 | 664 s |
+| 6 | 3 | 400 | 117.8 | 3.4 s / 4.8 s | 17,645 | 68.9 | 103 s |
+| 7 | 1 | 400 | 137.3 | 2.9 s / 3.3 s | 19,783 | 31.6 | 474 s |
+
+Runs 1 to 5 ran before the `published_at` change; runs 6 and 7 ran after it. Every run: 0 failed requests, every event delivered, `duplicate_success_events: 0`, receiver total = unique = events, `stream_pending: 0`.
+
+Smoke run (20 rps, 361 events, after the first two fixes): end-to-end p50 168 ms, p95 345 ms, p99 628 ms, drain 0.3 s.
+
+Run 5's first report ended FAIL because it hit the old 300 s drain timeout with about 2,350 events still queued. Re-running `report` on the same event type later gave 24,309 / 24,309 delivered and PASS (no data was lost).
+
+The same results are written up for the repo in `docs/load-test-results.md`.
+
+## Findings
+
+* Ingest saturates at about 150 events/s on this laptop. At a 400 rps target the API achieved roughly 120 to 170 rps and showed the excess as latency, with zero errors.
+* One worker delivers about 32 events/s, three deliver about 69/s (2.2× throughput). Draining the saturated backlog took 474 s with 1 worker and 103 s with 3.
+* Going from 1 to 3 workers lowered ingest (137 to 118 rps) because everything shares the laptop's CPU.
+* End-to-end latency in saturated runs is queue wait, not a latency figure. Use the smoke-run numbers and the low-rate ingest percentiles for latency claims.
+
+## Numbers that are safe to cite (with "single laptop, load generator co-located")
+
+* About 125,000 events across 7 runs: zero lost, zero duplicate deliveries (checked in the DB and at the receiver).
+* Ingest p99 under 260 ms at 50 rps, and p99 700 ms at 100 rps.
+* Delivery throughput 31.6 to 68.9 events/s going from 1 to 3 workers (2.2×); backlog drain 474 s to 103 s.
+* Unloaded end-to-end latency at 20 rps: p50 168 ms, p99 628 ms.
+
+---
+
+# Open items and things to remember
+
+* **Unexplained: run 1's delivery rate.** At 50 rps with 3 workers, delivery lagged about 23 s behind (≈39/s), against 67 to 69/s in every later run. Likely warm-up or laptop CPU contention, but not confirmed. Re-run 50 rps once with the final code before claiming the system keeps up at that rate.
+* **Tests not re-confirmed in chat after the Day 2 code changes.** Run both suites at the start of the next chat. Tests that import `worker` only work in the worker container:
+
+  ```bash
+  docker compose exec api pytest -v --ignore=tests/test_circuit_breaker.py --ignore=tests/test_worker_reliability.py
+  docker compose exec worker pytest /app/tests/test_circuit_breaker.py /app/tests/test_worker_reliability.py -v
+  ```
+
+* **Docs not yet updated for `published_at`:** `api/docs/schema.md` (Event fields) and `api/docs/delivery-states.md` (reconciler / safety nets).
+* After any worker, scheduler or API code change run `docker compose restart api worker retry-scheduler`. After pulling schema changes run `docker compose exec api alembic upgrade head`.
+* The retry scheduler is single-instance by design. Scaling it would need row claiming with `SELECT ... FOR UPDATE SKIP LOCKED`.
+* Each worker handles one stream message at a time (`count=1`, a new HTTP client per delivery), about 22 to 30 deliveries/s per worker.
+* The API is a single uvicorn process. Optional levers if the ceiling matters before deployment: `uvicorn --workers 4`, and concurrent message handling in the worker. If tried, keep before/after numbers.
+* The circuit breaker still counts across events, with its threshold hard-coded at 5 (unchanged from Week 4).
+
+## Material for docs/design-decisions.md (Day 5)
+
+* Dual write (commit then publish) and why the reconciler plus `published_at` closes the gap; the cost of the extra write.
+* Blocking DB calls inside an async handler and the connection-pool stall they caused; fixed with a threadpool and a larger pool.
+* At-least-once delivery: the fan-out guard and the unique constraint prevent duplicates in normal operation, and receivers should still dedupe.
+* The circuit breaker counting across events, and how retries interact with it (from Week 4).
+* Single-instance retry scheduler and what it would take to scale.
+* Sub-linear worker scaling on a shared machine (2.2× for 3 workers).
+
+---
+
+# Next step — Week 5, Day 3: Deployment
+
+Plan item: managed Postgres and Redis on free tiers, API + workers + dashboard as separate services, GitHub Actions (test, build, deploy), and a live instance seeded with demo subscribers including a permanently toggleable "flaky" one.
+
+Check before choosing platforms:
+
+* Whether the managed Redis supports Streams **and blocking `XREADGROUP`**, and what its command/connection limits are. The workers block on `XREADGROUP` for up to 5 s in a loop.
+* Whether the platform offers always-on background workers on its free tier. The worker, retry-scheduler and demo-subscriber are long-running processes, not web services.
+
+Known deployment to-dos from earlier chats:
+
+* Add the deployed dashboard URL to the CORS origin list in `api/app/main.py` (currently only `http://localhost:3000`).
+* Set `NEXT_PUBLIC_API_URL` (browser-facing API URL) and `DEMO_SUBSCRIBER_URL` (server-side, used by the dashboard's `/api/outage` proxy) per environment.
+* Switch `dashboard/Dockerfile` from `npm run dev` to a production build.
+* `alembic.ini` has a hard-coded `sqlalchemy.url` (`postgres:5432` with demo credentials); deployed migrations need to use `DATABASE_URL`.
+* Workers need unique consumer names per instance. The hostname-based default now covers this.
+
+## Reminders for the next chat
+
+* Continue from the current implementation. Do not redesign the schema or worker beyond what concrete requirements demand.
+* Key paths: API routes `api/app/routes/`, workers `workers/`, dashboard `dashboard/src/`, scripts `api/scripts/`, load tests `loadtest/`, results `api/loadtest_results/`.
+* Compose commands: `docker compose up -d --scale worker=3 worker` to scale workers; the demo receiver is `demo-subscriber` (port 8001) and the second receiver is `demo-subscriber-2` (port 8002).
+* Attach both "Completed until now.md" and this addendum.
